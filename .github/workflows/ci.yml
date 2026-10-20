@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+  ZIG_LINUX_X86_64_SHA256: "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+  ZIG_MACOS_AARCH64_SHA256: "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a"
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig_tarball: zig-x86_64-linux-0.17.0.tar.xz
+            zig_sha256: "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+          - os: macos-latest
+            zig_tarball: zig-aarch64-macos-0.17.0.tar.xz
+            zig_sha256: "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig 0.17.0 (SHA-256 verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://ziglang.org/download/${ZIG_VERSION}/${{ matrix.zig_tarball }}"
+          curl -fsSL "$URL" -o zig.tar.xz
+          echo "${{ matrix.zig_sha256 }}  zig.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/zig/zig" version
+
+      - name: Authorship & repository hygiene gate
+        run: python3 test/verify_authorship.py
+
+      - name: Check formatting (zig fmt --check)
+        run: zig fmt --check .
+
+      - name: Check Bot API 10.3 codegen determinism (zig build spec-check)
+        run: zig build spec-check
+
+      - name: Run Debug test suite, surface probe, OOM tests, CLI & examples
+        run: zig build test --summary all
+
+      - name: Run ReleaseSafe test suite
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Run ReleaseFast test suite
+        run: zig build test -Doptimize=ReleaseFast
+
+      - name: Run ReleaseFast performance regression gate (zig build perf-check)
+        run: zig build perf-check
+
+      - name: Run bounded fuzzers (50K iterations)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p .zig-cache/tmp
+          zig build test -Dllvm=true --fuzz=50K
+
+      - name: Cross-compile CLI targets
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos x86_64-windows-gnu; do
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe
+          done

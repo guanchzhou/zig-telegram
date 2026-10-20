@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>zig-telegram — Complete Telegram Bot API 10.3 &amp; MTProto 2.0 SDK for Zig 0.17</title>
+  <meta name="description" content="Zero-dependency, pure-Zig Telegram SDK covering 100% of Bot API 10.3 (185 methods, 400 types), recursive attach:// multipart streaming, single-pass discriminated unions, and pure-Zig MTProto 2.0.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a href="#" class="brand">
+        <span class="brand-mark">ZT</span>
+        <span>zig-telegram</span>
+        <span class="brand-tag">v0.1.0 · Zig 0.17.0</span>
+      </a>
+      <nav class="nav-links">
+        <a href="#architecture">Architecture</a>
+        <a href="#matrix">Ecosystem Matrix</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#explorer">185 Methods</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="api/" class="btn-nav">API Autodoc ↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="spec-ribbon">
+        <span class="spec-dot"></span>
+        <span>SPECIFICATION LOCK: TELEGRAM BOT API 10.3 (2026-08-24) · MTPROTO 2.0 RFC · ZERO LIBC</span>
+      </div>
+
+      <div class="hero-grid">
+        <div>
+          <h1>Precision-Engineered <span class="hl">Telegram Stack</span> for Zig 0.17.</h1>
+          <p class="hero-lead">
+            <strong>zig-telegram</strong> unifies three protocol planes in one zero-dependency Zig package:
+            100% deterministic codegen for <strong>Bot API 10.3</strong> (all 185 methods &amp; 400 types/unions),
+            a pure-Zig <strong>MTProto 2.0</strong> binary/cryptographic core (TL codec, AES-256-IGE, SHA-256 <code>msg_key</code>, Obfuscated2 framing),
+            and an optional runtime-loaded <strong>TDLib <code>tdjson</code></strong> bridge.
+          </p>
+
+          <div class="hero-actions">
+            <a href="https://github.com/guanchzhou/zig-telegram" class="btn btn-primary">GitHub Repository ↗</a>
+            <a href="api/" class="btn">Browse Zig Autodoc (/api/)</a>
+            <a href="#quickstart" class="btn">Install via zig fetch</a>
+          </div>
+
+          <div class="telemetry-strip">
+            <div class="metric-box">
+              <div class="metric-val">185 / 185</div>
+              <div class="metric-lbl">Bot API 10.3 Methods</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-val">400</div>
+              <div class="metric-lbl">Typed Structs &amp; Unions</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-val">979 MiB/s</div>
+              <div class="metric-lbl">MTProto AES-256-IGE</div>
+            </div>
+            <div class="metric-box">
+              <div class="metric-val">0 C Deps</div>
+              <div class="metric-lbl">Pure std.http + std.crypto</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="terminal-card">
+          <div class="terminal-header">
+            <div class="terminal-dots"><span></span><span></span><span></span></div>
+            <span>echo_bot.zig — Zig 0.17.0</span>
+          </div>
+          <pre class="terminal-body"><code><span class="c-kw">const</span> std = @import(<span class="c-str">"std"</span>);
+<span class="c-kw">const</span> telegram = @import(<span class="c-str">"telegram"</span>);
+
+<span class="c-kw">pub fn</span> main(init: std.process.Init) !<span class="c-ty">void</span> {
+    <span class="c-kw">var</span> http: telegram.transport.HttpTransport = .init(init.gpa, init.io);
+    <span class="c-kw">defer</span> http.deinit();
+
+    <span class="c-kw">const</span> token = <span class="c-kw">try</span> telegram.SecretToken.initValidated(<span class="c-str">"123456:ABC-DEF"</span>);
+    <span class="c-kw">var</span> client = telegram.bot.BotClient.init(
+        init.gpa, init.io, token, http.transport(), .{},
+    );
+
+    <span class="c-kw">var</span> detail: ?telegram.ErrorDetail = <span class="c-kw">null</span>;
+    <span class="c-kw">defer if</span> (detail) |*d| d.deinit(init.gpa);
+
+    <span class="c-kw">var</span> msg = <span class="c-kw">try</span> client.sendMessage(.{
+        .chat_id = .fromInt(42),
+        .text = <span class="c-str">"Hello from zig-telegram (Bot API 10.3)!"</span>,
+        .parse_mode = .MarkdownV2,
+    }, &amp;detail);
+    <span class="c-kw">defer</span> msg.deinit();
+}</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="section-head">
+        <div>
+          <span class="section-id">01 // THREE-PLANE ARCHITECTURE</span>
+          <h2 class="section-title">One Module. Three Protocol Planes. Zero Hidden State.</h2>
+        </div>
+        <p class="section-sub">
+          Every network call, allocator, and error diagnostic is explicit. Choose high-level Bot API 10.3 ergonomics,
+          low-level MTProto 2.0 binary framing, or dynamic TDLib JSON bindings.
+        </p>
+      </div>
+
+      <div class="blueprint-svg-wrap">
+        <svg viewBox="0 0 1120 230" width="100%" height="auto" role="img" aria-label="zig-telegram three-plane architecture diagram">
+          <rect x="8" y="12" width="345" height="206" rx="6" fill="#0d121a" stroke="#2d4059" stroke-width="1.5"/>
+          <text x="26" y="42" fill="#f7a41d" font-family="monospace" font-size="12" font-weight="bold">PLANE 1 · telegram.bot</text>
+          <text x="26" y="66" fill="#e6edf5" font-family="monospace" font-size="15" font-weight="bold">Bot API 10.3 Complete</text>
+          <text x="26" y="94" fill="#8b9bb0" font-family="monospace" font-size="12">• 185 Methods + 400 Types (codegen)</text>
+          <text x="26" y="116" fill="#8b9bb0" font-family="monospace" font-size="12">• Recursive attach:// Multipart Engine</text>
+          <text x="26" y="138" fill="#8b9bb0" font-family="monospace" font-size="12">• Single-Pass Discriminated Unions</text>
+          <text x="26" y="160" fill="#8b9bb0" font-family="monospace" font-size="12">• Poller (429 Retry-After) + Webhook</text>
+          <text x="26" y="182" fill="#8b9bb0" font-family="monospace" font-size="12">• Comptime Command &amp; Update Router</text>
+          <text x="26" y="202" fill="#34d399" font-family="monospace" font-size="11">→ Persistent std.http.Client TLS 1.3</text>
+
+          <rect x="387" y="12" width="345" height="206" rx="6" fill="#0d121a" stroke="#2d4059" stroke-width="1.5"/>
+          <text x="405" y="42" fill="#38bdf8" font-family="monospace" font-size="12" font-weight="bold">PLANE 2 · telegram.mtproto</text>
+          <text x="405" y="66" fill="#e6edf5" font-family="monospace" font-size="15" font-weight="bold">Pure-Zig MTProto 2.0 Core</text>
+          <text x="405" y="94" fill="#8b9bb0" font-family="monospace" font-size="12">• TL Binary Reader / Writer (4B align)</text>
+          <text x="405" y="116" fill="#8b9bb0" font-family="monospace" font-size="12">• AES-256-IGE + SHA-256 msg_key KDF</text>
+          <text x="405" y="138" fill="#8b9bb0" font-family="monospace" font-size="12">• Brent-Pollard Rho pq Factorization</text>
+          <text x="405" y="160" fill="#8b9bb0" font-family="monospace" font-size="12">• Abridged / Intermediate / Obfuscated2</text>
+          <text x="405" y="182" fill="#8b9bb0" font-family="monospace" font-size="12">• Monotonic 64-bit msg_id &amp; seq_no</text>
+          <text x="405" y="202" fill="#34d399" font-family="monospace" font-size="11">→ Zero OpenSSL / Zero C Dependencies</text>
+
+          <rect x="766" y="12" width="345" height="206" rx="6" fill="#0d121a" stroke="#2d4059" stroke-width="1.5"/>
+          <text x="784" y="42" fill="#34d399" font-family="monospace" font-size="12" font-weight="bold">PLANE 3 · telegram.tdlib</text>
+          <text x="784" y="66" fill="#e6edf5" font-family="monospace" font-size="15" font-weight="bold">Optional TDLib tdjson Bridge</text>
+          <text x="784" y="94" fill="#8b9bb0" font-family="monospace" font-size="12">• Dynamic std.DynLib Loader</text>
+          <text x="784" y="116" fill="#8b9bb0" font-family="monospace" font-size="12">• Zero Link-Time C/C++ Requirement</text>
+          <text x="784" y="138" fill="#8b9bb0" font-family="monospace" font-size="12">• Mockable C ABI Vtable for Testing</text>
+          <text x="784" y="160" fill="#8b9bb0" font-family="monospace" font-size="12">• create / send / receive / execute</text>
+          <text x="784" y="182" fill="#8b9bb0" font-family="monospace" font-size="12">• Linux .so / macOS .dylib / Win .dll</text>
+          <text x="784" y="202" fill="#34d399" font-family="monospace" font-size="11">→ Opt-In Only When Needed</text>
+        </svg>
+      </div>
+
+      <div class="planes-grid">
+        <div class="plane-card">
+          <span class="plane-badge">PLANE 01 // BOT API 10.3</span>
+          <h3>Recursive attach:// Multipart</h3>
+          <p>
+            Existing Zig libraries only inspect top-level method fields for <code>InputFile</code>, silently breaking
+            <code>sendMediaGroup</code>, <code>sendPaidMedia</code>, and <code>editMessageMedia</code>.
+          </p>
+          <ul class="plane-list">
+            <li>Walks structs, optionals, slices, and unions</li>
+            <li>Emits <code>"attach://part_&lt;n&gt;"</code> in JSON automatically</li>
+            <li>Streams binary parts with CSPRNG 128-bit boundaries</li>
+            <li>RFC 7578 filename quote/CRLF escaping</li>
+          </ul>
+        </div>
+
+        <div class="plane-card">
+          <span class="plane-badge">PLANE 02 // SECURITY &amp; RELIABILITY</span>
+          <h3>SecretToken &amp; Caller-Owned Errors</h3>
+          <p>
+            Bot tokens never leak in logs or stack traces, and concurrent threads never race on a shared mutable
+            <code>last_error</code> struct field.
+          </p>
+          <ul class="plane-list">
+            <li><code>SecretToken.format</code> prints <code>bot&lt;id&gt;:[REDACTED]</code></li>
+            <li>Constant-time SHA-256 webhook header verification</li>
+            <li>Explicit <code>err_out: ?*?ErrorDetail</code> with <code>retry_after</code></li>
+            <li>Automatic <code>--local</code> Bot API server path remapping</li>
+          </ul>
+        </div>
+
+        <div class="plane-card">
+          <span class="plane-badge">PLANE 03 // MTPROTO 2.0</span>
+          <h3>Pure-Zig Cryptography &amp; Framing</h3>
+          <p>
+            Full MTProto 2.0 binary packet codec built exclusively on Zig's standard library primitives.
+          </p>
+          <ul class="plane-list">
+            <li>AES-256-IGE mode on top of <code>std.crypto.core.aes.Aes256</code></li>
+            <li>MTProto 2.0 SHA-256 <code>msg_key</code> &amp; AES key/IV derivation</li>
+            <li>Abridged, Intermediate, Padded &amp; Obfuscated2 framing</li>
+            <li>64-bit time-synchronized monotonic <code>msg_id</code> generator</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="matrix">
+      <div class="section-head">
+        <div>
+          <span class="section-id">02 // ECOSYSTEM COMPARISON</span>
+          <h2 class="section-title">Why zig-telegram Replaces First-Gen Zig Wrappers</h2>
+        </div>
+        <p class="section-sub">
+          Audited against <code>zigtgshka</code>, <code>ziogram</code>, and <code>telebot.zig</code> across
+          specification coverage, multipart correctness, TLS connection reuse, and memory safety.
+        </p>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Capability</th>
+              <th>zig-telegram (0.17.0)</th>
+              <th>zigtgshka</th>
+              <th>ziogram</th>
+              <th>telebot.zig</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Telegram Bot API Spec</td>
+              <td><span class="tag-ok">10.3 (185 methods / 400 types)</span></td>
+              <td><span class="tag-warn">9.2 (161 methods)</span></td>
+              <td><span class="tag-bad">7.10 partial</span></td>
+              <td><span class="tag-bad">~30 manual methods</span></td>
+            </tr>
+            <tr>
+              <td>Nested <code>attach://</code> Multipart (<code>sendMediaGroup</code>)</td>
+              <td><span class="tag-ok">Recursive comptime + runtime</span></td>
+              <td><span class="tag-bad">Top-level fields only</span></td>
+              <td><span class="tag-bad">None</span></td>
+              <td><span class="tag-bad">libcurl C FFI</span></td>
+            </tr>
+            <tr>
+              <td>Discriminated Unions (23 unions + <code>RichText</code>)</td>
+              <td><span class="tag-ok">Single-pass zero-DOM scanner</span></td>
+              <td><span class="tag-warn">2-pass DOM allocation</span></td>
+              <td><span class="tag-bad">Incomplete</span></td>
+              <td><span class="tag-bad">Manual structs</span></td>
+            </tr>
+            <tr>
+              <td>HTTP Transport &amp; TLS 1.3 Keep-Alive</td>
+              <td><span class="tag-ok">Persistent pooled std.http.Client</span></td>
+              <td><span class="tag-warn">New client per request</span></td>
+              <td><span class="tag-warn">New client per request</span></td>
+              <td><span class="tag-bad">Requires C libcurl</span></td>
+            </tr>
+            <tr>
+              <td>Error Diagnostics (<code>retry_after</code>, <code>migrate_to_chat_id</code>)</td>
+              <td><span class="tag-ok">Caller-owned ?*?ErrorDetail</span></td>
+              <td><span class="tag-bad">Discarded on error</span></td>
+              <td><span class="tag-warn">Thread-unsafe struct field</span></td>
+              <td><span class="tag-bad">Status code only</span></td>
+            </tr>
+            <tr>
+              <td>Webhook Constant-Time Secret Verification</td>
+              <td><span class="tag-ok">SHA-256 + timing_safe.eql</span></td>
+              <td><span class="tag-bad">Not included</span></td>
+              <td><span class="tag-bad">Not included</span></td>
+              <td><span class="tag-bad">Not included</span></td>
+            </tr>
+            <tr>
+              <td>Pure-Zig MTProto 2.0 Core (TL + AES-256-IGE)</td>
+              <td><span class="tag-ok">Included (telegram.mtproto)</span></td>
+              <td><span class="tag-bad">No</span></td>
+              <td><span class="tag-bad">No</span></td>
+              <td><span class="tag-bad">No</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <div class="section-head">
+        <div>
+          <span class="section-id">03 // USAGE &amp; CODE EXAMPLES</span>
+          <h2 class="section-title">Copy-Ready Zig 0.17 Snippets</h2>
+        </div>
+        <p class="section-sub">
+          Add <code>zig-telegram</code> with <code>zig fetch --save git+https://github.com/guanchzhou/zig-telegram</code>
+          and import <code>@import("telegram")</code>.
+        </p>
+      </div>
+
+      <div class="tabs-bar" role="tablist">
+        <button class="tab-btn active" data-tab="tab-poll">Long Polling + Router</button>
+        <button class="tab-btn" data-tab="tab-media">Nested attach:// Media Group</button>
+        <button class="tab-btn" data-tab="tab-webhook">Constant-Time Webhook</button>
+        <button class="tab-btn" data-tab="tab-mtproto">MTProto 2.0 AES-256-IGE</button>
+        <button class="tab-btn" data-tab="tab-cli">CLI Tool</button>
+      </div>
+
+      <div id="tab-poll" class="tab-panel active">
+        <div class="terminal-card">
+          <div class="terminal-header"><span>examples/echo_bot.zig</span><span>BotClient + Router + Poller</span></div>
+          <pre class="terminal-body"><code><span class="c-kw">const</span> std = @import(<span class="c-str">"std"</span>);
+<span class="c-kw">const</span> telegram = @import(<span class="c-str">"telegram"</span>);
+
+<span class="c-kw">const</span> AppCtx = <span class="c-kw">struct</span> {
+    client: *telegram.bot.BotClient,
+    pub <span class="c-kw">fn</span> onStart(self: *@This(), msg: telegram.bot.types.Message, args: []<span class="c-kw">const</span> u8) !<span class="c-ty">void</span> {
+        _ = args;
+        <span class="c-kw">var</span> r = <span class="c-kw">try</span> self.client.sendMessage(.{
+            .chat_id = .fromInt(msg.chat.id),
+            .text = <span class="c-str">"Welcome to zig-telegram!"</span>,
+        }, <span class="c-kw">null</span>);
+        r.deinit();
+    }
+};
+
+<span class="c-kw">const</span> AppRouter = telegram.bot.Router(*AppCtx, .{
+    .commands = &amp;.{.{ .name = <span class="c-str">"start"</span>, .handler = AppCtx.onStart }},
+});</code></pre>
+        </div>
+      </div>
+
+      <div id="tab-media" class="tab-panel">
+        <div class="terminal-card">
+          <div class="terminal-header"><span>examples/media_group.zig</span><span>Recursive attach:// Multipart Streaming</span></div>
+          <pre class="terminal-body"><code><span class="c-kw">const</span> media_items = [_]telegram.bot.types.InputMedia{
+    .{ .photo = .{
+        .media = .fromBytes(<span class="c-str">"diagram.png"</span>, png_bytes),
+        .caption = <span class="c-str">"Uploaded via attach://part_0"</span>,
+    } },
+    .{ .document = .{
+        .media = .fromPath(<span class="c-str">"./spec/bot_api_10_3.json"</span>),
+        .thumbnail = .fromBytes(<span class="c-str">"thumb.jpg"</span>, jpg_bytes),
+    } },
+};
+
+<span class="c-kw">var</span> sent = <span class="c-kw">try</span> client.sendMediaGroup(.{
+    .chat_id = .fromChannel(<span class="c-str">"@zig_announcements"</span>),
+    .media = &amp;media_items,
+}, <span class="c-kw">null</span>);
+<span class="c-kw">defer</span> sent.deinit();</code></pre>
+        </div>
+      </div>
+
+      <div id="tab-webhook" class="tab-panel">
+        <div class="terminal-card">
+          <div class="terminal-header"><span>examples/webhook_bot.zig</span><span>Constant-Time X-Telegram-Bot-Api-Secret-Token Verification</span></div>
+          <pre class="terminal-body"><code><span class="c-kw">var</span> processor: telegram.bot.WebhookProcessor = .{
+    .expected_secret_token = <span class="c-str">"whsec_super_secret_token_2026"</span>,
+};
+
+<span class="c-kw">var</span> update = <span class="c-kw">try</span> processor.verifyAndParseUpdate(
+    allocator,
+    headers,
+    request_body,
+);
+<span class="c-kw">defer</span> update.deinit();</code></pre>
+        </div>
+      </div>
+
+      <div id="tab-mtproto" class="tab-panel">
+        <div class="terminal-card">
+          <div class="terminal-header"><span>examples/mtproto_frame.zig</span><span>Pure-Zig MTProto 2.0 Session + Intermediate Framing</span></div>
+          <pre class="terminal-body"><code><span class="c-kw">var</span> session = telegram.mtproto.session.Session.init(
+    auth_key,
+    0x0102030405060708,
+    0x1122334455667788,
+);
+
+<span class="c-kw">const</span> encrypted = <span class="c-kw">try</span> session.encryptPacket(
+    allocator,
+    tl_payload,
+    unix_time_sec,
+    <span class="c-kw">true</span>,
+    .client_to_server,
+    random_pad,
+);
+<span class="c-kw">defer</span> allocator.free(encrypted.packet);</code></pre>
+        </div>
+      </div>
+
+      <div id="tab-cli" class="tab-panel">
+        <div class="terminal-card">
+          <div class="terminal-header"><span>zig-telegram CLI</span><span>Zero-Dependency Terminal Utility</span></div>
+          <pre class="terminal-body"><code>$ zig build run -- spec
+Telegram Bot API 10.3 (August 24, 2026) — 185 methods
+
+$ zig build run -- mtproto
+MTProto 2.0 Self-Test: OK (auth_key_id=0x..., msg_id=0x..., packet=64 bytes, factorizePq(0x17ED48941A08F981)=0x494C553B * 0x53911073)
+
+$ TELEGRAM_BOT_TOKEN="123456:ABC-DEF" zig build run -- send --chat 42 --text "Deployed!"</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="explorer">
+      <div class="section-head">
+        <div>
+          <span class="section-id">04 // INTERACTIVE BOT API 10.3 CATALOG</span>
+          <h2 class="section-title">Explore All 185 Generated BotClient Methods</h2>
+        </div>
+        <p class="section-sub">
+          Filter every method generated from <code>spec/bot_api_10_3.json</code>. Each method is available on
+          <code>telegram.bot.BotClient</code> with strongly-typed parameters in <code>telegram.bot.methods</code>.
+        </p>
+      </div>
+
+      <div class="explorer-controls">
+        <input type="search" id="method-search" class="search-input" placeholder="Filter 185 Bot API 10.3 methods (e.g. sendMediaGroup, SuggestedPost, Gift, Star, Checklist, Poll)..." aria-label="Filter Bot API methods">
+      </div>
+      <div id="method-grid" class="method-pills"></div>
+    </section>
+
+    <section id="benchmarks">
+      <div class="section-head">
+        <div>
+          <span class="section-id">05 // RELEASEFAST TELEMETRY</span>
+          <h2 class="section-title">Measured Performance on Apple Silicon (Zig 0.17.0 ReleaseFast)</h2>
+        </div>
+        <p class="section-sub">
+          Reproduce locally with <code>zig build bench</code> and enforce the regression gate in CI via <code>zig build perf-check</code>.
+        </p>
+      </div>
+
+      <div class="bench-grid">
+        <div class="bench-card">
+          <h4>Discriminated Union JSON Decode (ChatMember)</h4>
+          <p class="section-sub">Zero-allocation top-level tag scanner vs 2-pass <code>std.json.Value</code> DOM tree allocation.</p>
+          <div class="bar-row">
+            <div class="bar-label"><span>zig-telegram Single-Pass Scanner</span><span>740 ns/op (1.17x faster)</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width: 85%;"></div></div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label"><span>2-Pass std.json.Value DOM</span><span>863 ns/op</span></div>
+            <div class="bar-track"><div class="bar-fill alt" style="width: 100%;"></div></div>
+          </div>
+        </div>
+
+        <div class="bench-card">
+          <h4>Protocol &amp; Cryptographic Throughput</h4>
+          <p class="section-sub">Pure-Zig MTProto 2.0 AES-256-IGE packet encryption and constant-time SHA-256 webhook verification.</p>
+          <div class="bar-row">
+            <div class="bar-label"><span>MTProto 2.0 AES-256-IGE (1 KiB packet)</span><span>979.2 MiB/s</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width: 96%;"></div></div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label"><span>Full Update JSON Envelope Parse</span><span>1,696 ns/op</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width: 78%;"></div></div>
+          </div>
+          <div class="bar-row">
+            <div class="bar-label"><span>Webhook SHA-256 Constant-Time Verify</span><span>34 ns/op</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width: 18%;"></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <span>MIT License · Copyright © 2026 Andrey Maltsev</span>
+      <span><a href="https://github.com/guanchzhou/zig-telegram">GitHub</a> · <a href="api/">Zig Autodoc API Reference</a></span>
+    </div>
+  </footer>
+
+  <script>
+    const METHODS = [
+      "addStickerToSet","answerCallbackQuery","answerChatJoinRequest","answerInlineQuery","answerPreCheckoutQuery","answerShippingQuery","answerWebAppQuery","approveChatJoinRequest"," approveSuggestedPost","banChatMember","banChatSenderChat","close","closeForumTopic","closeGeneralForumTopic","convertGiftToStars","copyMessage","copyMessages","createChatInviteLink","createChatSubscriptionInviteLink","createForumTopic","createInvoiceLink","createNewStickerSet","createSubordinateBot","declineChatJoinRequest","declineSuggestedPost","deleteBusinessMessages","deleteChatPhoto","deleteChatStickerSet","deleteForumTopic","deleteMessage","deleteMessages","deleteMyCommands","deletePassportDataErrors","deleteStickerFromSet","deleteStickerSet","deleteStory","deleteWebhook","editChatInviteLink","editChatSubscriptionInviteLink","editForumTopic","editGeneralForumTopic","editMessageCaption","editMessageChecklist","editMessageLiveLocation","editMessageMedia","editMessageReplyMarkup","editMessageText","editStory","editUserStarSubscription","exportChatInviteLink","forwardMessage","forwardMessages","getAvailableGifts","getBusinessAccountGifts","getBusinessAccountStarBalance","getBusinessConnection","getChat","getChatAdministrators","getChatGifts","getChatMember","getChatMemberCount","getChatMenuButton","getChatSubscription","getCollectibleItemInfo","getCustomEmojiStickers","getFile","getForumTopicIconStickers","getGameHighScores","getManagedBotToken","getMe","getMyCommands","getMyDefaultAdministratorRights","getMyDescription","getMyName","getMyShortDescription","getMyStarBalance","getPaidMessageRevenue","getPollVoters","getStarTransactions","getStickerSet","getStickers","getSubordinateBots","getUpdates","getUserChatBoosts","getUserGifts","getUserProfileAudios","getUserProfilePhotos","getUserSubscriptions","getWebhookInfo","giftPremiumSubscription","hideGeneralForumTopic","leaveChat","logOut","pinChatMessage","postStory","promoteChatMember","readBusinessMessage","refundStarPayment","removeBusinessAccountProfilePhoto","removeChatVerification","removeMyProfilePhoto","removeUserVerification","reopenForumTopic","reopenGeneralForumTopic","replaceManagedBotToken","replaceStickerInSet","repostStory","restrictChatMember","revokeChatInviteLink","revokeManagedBotToken","savePreparedInlineMessage","savePreparedKeyboardButton","sendAnimation","sendAudio","sendChatAction","sendChecklist","sendContact","sendDice","sendDocument","sendGame","sendGift","sendInvoice","sendLocation","sendMediaGroup","sendMessage","sendMessageDraft","sendPaidMedia","sendPhoto","sendPoll","sendRichMessage","sendSticker","sendVenue","sendVideo","sendVideoNote","sendVoice","setBusinessAccountBio","setBusinessAccountGiftSettings","setBusinessAccountName","setBusinessAccountProfilePhoto","setBusinessAccountUsername","setChatAdministratorCustomTitle","setChatDescription","setChatMemberTag","setChatMenuButton","setChatPermissions","setChatPhoto","setChatStickerSet","setChatSubscription","setChatSubscriptionPrices","setChatTitle","setCustomEmojiStickerSetThumbnail","setGameScore","setMessageReaction","setMyCommands","setMyDefaultAdministratorRights","setMyDescription","setMyName","setMyProfilePhoto","setMyShortDescription","setPaidMessagePrice","setPassportDataErrors","setStickerEmojiList","setStickerKeywords","setStickerMaskPosition","setStickerPositionInSet","setStickerSetThumbnail","setStickerSetTitle","setUserEmojiStatus","setWebhook","stopMessageLiveLocation","stopPoll","transferBusinessAccountStars","transferGift","unbanChatMember","unbanChatSenderChat","unhideGeneralForumTopic","unpinAllChatMessages","unpinAllForumTopicMessages","unpinAllGeneralForumTopicMessages","unpinChatMessage","upgradeGift","uploadStickerFile","verifyChat","verifyUser"
+    ].map(m => m.trim());
+
+    const grid = document.getElementById("method-grid");
+    const search = document.getElementById("method-search");
+
+    function renderMethods(q) {
+      const needle = (q || "").toLowerCase().trim();
+      grid.innerHTML = "";
+      for (const m of METHODS) {
+        if (needle && !m.toLowerCase().includes(needle)) continue;
+        const el = document.createElement("div");
+        el.className = "method-pill";
+        el.innerHTML = `<span>.${m}()</span><span class="cat">10.3</span>`;
+        grid.appendChild(el);
+      }
+    }
+    renderMethods("");
+    search.addEventListener("input", (e) => renderMethods(e.target.value));
+
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById(btn.dataset.tab).classList.add("active");
+      });
+    });
+  </script>
+</body>
+</html>

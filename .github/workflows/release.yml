@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  ZIG_VERSION: "0.17.0"
+  ZIG_LINUX_X86_64_SHA256: "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+
+jobs:
+  release:
+    name: Build, Sign & Publish Release Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify authorship & hygiene
+        run: python3 test/verify_authorship.py
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "ERROR: No CHANGELOG.md section for $VERSION. Add one before tagging."
+            exit 1
+          fi
+
+      - name: Install Zig 0.17.0 (SHA-256 verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-0.17.0.tar.xz"
+          curl -fsSL "$URL" -o zig.tar.xz
+          echo "${ZIG_LINUX_X86_64_SHA256}  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Run full verification suite
+        run: |
+          zig fmt --check .
+          zig build spec-check
+          zig build test -Doptimize=ReleaseSafe
+
+      - name: Build cross-platform release archives
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="${TAG_NAME#v}"
+          mkdir -p dist
+          declare -A ARCHIVES=(
+            ["x86_64-linux-musl"]="linux-amd64"
+            ["aarch64-linux-musl"]="linux-arm64"
+            ["x86_64-macos"]="darwin-amd64"
+            ["aarch64-macos"]="darwin-arm64"
+          )
+          for target in "${!ARCHIVES[@]}"; do
+            suffix="${ARCHIVES[$target]}"
+            rm -rf zig-out pkg
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe
+            mkdir -p pkg
+            cp zig-out/bin/zig-telegram LICENSE README.md CHANGELOG.md sbom.cdx.json pkg/
+            art="zig-telegram-${VER}-${suffix}.tar.gz"
+            tar -C pkg -czf "dist/${art}" zig-telegram LICENSE README.md CHANGELOG.md sbom.cdx.json
+            (cd dist && sha256sum "${art}" > "${art}.sha256")
+          done
+          cp sbom.cdx.json dist/
+          (cd dist && sha256sum *.tar.gz sbom.cdx.json > SHA256SUMS)
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign SHA256SUMS and SBOM with Cosign keyless OIDC
+        run: |
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            dist/SHA256SUMS
+          cosign sign-blob --yes \
+            --bundle dist/sbom.cdx.json.sigstore.json \
+            dist/sbom.cdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            dist/*.tar.gz \
+            dist/*.tar.gz.sha256 \
+            dist/sbom.cdx.json \
+            dist/sbom.cdx.json.sigstore.json \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sigstore.json \
+            --title "zig-telegram ${TAG_NAME}" \
+            --notes-file release-notes.md
+
+      - name: Update Homebrew tap (if HOMEBREW_TAP_TOKEN is configured)
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="${TAG_NAME#v}"
+          sha() { sha256sum "$1" | awk '{print $1}'; }
+          SHA_DARWIN_ARM=$(sha "dist/zig-telegram-${VER}-darwin-arm64.tar.gz")
+          SHA_DARWIN_AMD=$(sha "dist/zig-telegram-${VER}-darwin-amd64.tar.gz")
+          SHA_LINUX_ARM=$(sha "dist/zig-telegram-${VER}-linux-arm64.tar.gz")
+          SHA_LINUX_AMD=$(sha "dist/zig-telegram-${VER}-linux-amd64.tar.gz")
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/guanchzhou/homebrew-tap.git" /tmp/homebrew-tap
+          mkdir -p /tmp/homebrew-tap/Formula
+          cat > /tmp/homebrew-tap/Formula/zig-telegram.rb << FORMULA
+          class ZigTelegram < Formula
+            desc "Telegram Bot API 10.3 & MTProto 2.0 SDK and CLI for Zig 0.17"
+            homepage "https://guanchzhou.github.io/zig-telegram/"
+            version "${VER}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-darwin-arm64.tar.gz"
+                sha256 "${SHA_DARWIN_ARM}"
+              end
+              on_intel do
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-darwin-amd64.tar.gz"
+                sha256 "${SHA_DARWIN_AMD}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-linux-arm64.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              end
+              on_intel do
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-linux-amd64.tar.gz"
+                sha256 "${SHA_LINUX_AMD}"
+              end
+            end
+
+            def install
+              bin.install "zig-telegram"
+            end
+
+            test do
+              assert_match "Telegram Bot API 10.3", shell_output("#{bin}/zig-telegram spec")
+            end
+          end
+          FORMULA
+
+          cd /tmp/homebrew-tap
+          git config user.email "maltsev.andrey@gmail.com"
+          git config user.name "Andrey Maltsev"
+          git add Formula/zig-telegram.rb
+          git commit -m "Update zig-telegram to v${VER}"
+          git push

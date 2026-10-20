@@ -1,0 +1,23 @@
+.{
+    .name = .zig_telegram,
+    .version = "0.1.0",
+    .fingerprint = 0x61f0695ad1171833,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+        "examples",
+        "bench",
+        "tools",
+        "spec",
+        "docs",
+        "LICENSE",
+        "SECURITY.md",
+        "README.md",
+        "CHANGELOG.md",
+        "sbom.cdx.json",
+    },
+}
