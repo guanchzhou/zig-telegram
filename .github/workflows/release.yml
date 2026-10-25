@@ -154,7 +154,6 @@ jobs:
           class ZigTelegram < Formula
             desc "Zero-dependency Telegram Bot API 10.3 & MTProto 2.0 SDK and CLI in pure Zig"
             homepage "https://github.com/guanchzhou/zig-telegram"
-            version "${VER}"
             license "MIT"
 
             livecheck do
@@ -164,22 +163,22 @@ jobs:
 
             on_macos do
               on_arm do
-                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-darwin-arm64.tar.gz"
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v${VER}/zig-telegram-${VER}-darwin-arm64.tar.gz"
                 sha256 "${SHA_DARWIN_ARM}"
               end
               on_intel do
-                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-darwin-amd64.tar.gz"
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v${VER}/zig-telegram-${VER}-darwin-amd64.tar.gz"
                 sha256 "${SHA_DARWIN_AMD}"
               end
             end
 
             on_linux do
               on_arm do
-                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-linux-arm64.tar.gz"
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v${VER}/zig-telegram-${VER}-linux-arm64.tar.gz"
                 sha256 "${SHA_LINUX_ARM}"
               end
               on_intel do
-                url "https://github.com/guanchzhou/zig-telegram/releases/download/v#{version}/zig-telegram-#{version}-linux-amd64.tar.gz"
+                url "https://github.com/guanchzhou/zig-telegram/releases/download/v${VER}/zig-telegram-${VER}-linux-amd64.tar.gz"
                 sha256 "${SHA_LINUX_AMD}"
               end
             end
