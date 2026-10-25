@@ -101,3 +101,35 @@ test "CLI me, send, call, and webhook with MockTransport" {
     try std.testing.expectEqual(@as(u8, 0), code_wh);
     try std.testing.expectEqualStrings("{\"ok\":true}\n", out.written());
 }
+
+test "CLI rejects non-https --api-url unless the host is loopback" {
+    try std.testing.expect(cli.isAllowedApiUrl("https://api.telegram.org"));
+    try std.testing.expect(cli.isAllowedApiUrl("http://127.0.0.1:8081"));
+    try std.testing.expect(cli.isAllowedApiUrl("http://localhost:8081"));
+    try std.testing.expect(cli.isAllowedApiUrl("http://[::1]:8081"));
+    try std.testing.expect(!cli.isAllowedApiUrl("http://api.telegram.org"));
+    try std.testing.expect(!cli.isAllowedApiUrl("http://127.0.0.1.evil.example"));
+    try std.testing.expect(!cli.isAllowedApiUrl("ftp://127.0.0.1"));
+    try std.testing.expect(!cli.isAllowedApiUrl("not a url"));
+
+    const allocator = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var err_out: std.Io.Writer.Allocating = .init(allocator);
+    defer err_out.deinit();
+    var mock = telegram.MockTransport.init(allocator);
+    defer mock.deinit();
+    const code = try cli.runCli(allocator, std.testing.io, &.{ "me", "--token", "123:abc", "--api-url", "http://example.com" }, null, mock.transport(), &out.writer, &err_out.writer);
+    try std.testing.expectEqual(@as(u8, 2), code);
+    try std.testing.expect(mock.recorded.items.len == 0);
+}
+
+test "callRawJson rejects invalid method names before sending" {
+    const allocator = std.testing.allocator;
+    var mock = telegram.MockTransport.init(allocator);
+    defer mock.deinit();
+    const token = try telegram.SecretToken.initValidated("123:abc");
+    const client = telegram.BotClient.init(allocator, std.testing.io, token, mock.transport(), .{});
+    try std.testing.expectError(error.InvalidMethodName, client.callRawJson(allocator, "../getMe", null));
+    try std.testing.expect(mock.recorded.items.len == 0);
+}

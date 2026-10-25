@@ -14,6 +14,7 @@ pub const SecretToken = struct {
         InvalidBotId,
         EmptySecretPart,
         ContainsControlOrWhitespace,
+        InvalidSecretCharacter,
     };
 
     /// Wraps a raw token without validating its structure.
@@ -21,8 +22,9 @@ pub const SecretToken = struct {
         return .{ .raw = raw };
     }
 
-    /// Validates that `raw` has the structure `<positive_i64_bot_id>:<non_empty_secret>`
-    /// and contains no whitespace or ASCII control characters.
+    /// Validates that `raw` has the structure `<positive_i64_bot_id>:<non_empty_secret>`,
+    /// contains no whitespace or ASCII control characters, and that the secret
+    /// is limited to `[A-Za-z0-9_-]` so it cannot alter the request URL.
     pub fn initValidated(raw: []const u8) ValidationError!SecretToken {
         if (raw.len == 0) return error.EmptyToken;
         for (raw) |b| {
@@ -35,6 +37,9 @@ pub const SecretToken = struct {
         if (parsed_id <= 0) return error.InvalidBotId;
         const secret_part = raw[colon + 1 ..];
         if (secret_part.len == 0) return error.EmptySecretPart;
+        for (secret_part) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return error.InvalidSecretCharacter;
+        }
         return .{ .raw = raw };
     }
 
@@ -101,6 +106,10 @@ test "SecretToken validation and redaction" {
     try std.testing.expectError(error.InvalidBotId, SecretToken.initValidated("abc:secret"));
     try std.testing.expectError(error.EmptySecretPart, SecretToken.initValidated("123456:"));
     try std.testing.expectError(error.ContainsControlOrWhitespace, SecretToken.initValidated("123:sec ret"));
+    try std.testing.expectError(error.InvalidSecretCharacter, SecretToken.initValidated("123:abc/../getMe"));
+    try std.testing.expectError(error.InvalidSecretCharacter, SecretToken.initValidated("123:abc?x=1"));
+    try std.testing.expectError(error.InvalidSecretCharacter, SecretToken.initValidated("123:abc:def"));
+    _ = try SecretToken.initValidated("123:AAH-x_9");
 }
 
 test "verifyWebhookSecretConstantTime" {

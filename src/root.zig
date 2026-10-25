@@ -11,7 +11,7 @@
 //!   Intermediate / Obfuscated2 framing, and session state machine).
 //! - `telegram.tdlib`: Optional zero-cost `libtdjson` dynamic C ABI bridge.
 
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 pub const bot_api_version = bot.methods.spec_version;
 
 pub const secret = @import("secret.zig");

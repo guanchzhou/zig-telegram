@@ -9,14 +9,14 @@
       {
         "vendor": "zig-telegram",
         "name": "hand-authored-from-build.zig.zon",
-        "version": "0.1.0"
+        "version": "0.1.1"
       }
     ],
     "component": {
       "type": "library",
-      "bom-ref": "pkg:generic/zig-telegram@0.1.0",
+      "bom-ref": "pkg:generic/zig-telegram@0.1.1",
       "name": "zig-telegram",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "Fast, memory-safe, zero-dependency Telegram Bot API 10.3, MTProto 2.0, and TDLib library and CLI for Zig 0.17",
       "licenses": [
         {
@@ -36,7 +36,7 @@
   "components": [],
   "dependencies": [
     {
-      "ref": "pkg:generic/zig-telegram@0.1.0",
+      "ref": "pkg:generic/zig-telegram@0.1.1",
       "dependsOn": []
     }
   ]

@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 const telegram = @import("telegram");
 
 pub const usage_text =
-    \\zig-telegram 0.1.0 — Fast, memory-safe Telegram Bot API 10.3 & MTProto 2.0 CLI
+    \\zig-telegram 0.1.1 — Fast, memory-safe Telegram Bot API 10.3 & MTProto 2.0 CLI
     \\
     \\USAGE:
     \\  zig-telegram <command> [options]
@@ -38,7 +38,8 @@ pub const usage_text =
     \\
     \\GLOBAL OPTIONS:
     \\  --token <bot_token>               Bot token (or set TELEGRAM_BOT_TOKEN)
-    \\  --api-url <url>                   Override Bot API base URL (default: https://api.telegram.org)
+    \\  --api-url <url>                   Override Bot API base URL (default: https://api.telegram.org;
+    \\                                    plain http:// only for loopback hosts)
     \\  --help, -h                        Print this help message
     \\
 ;
@@ -112,6 +113,11 @@ pub fn runCli(
             }
             api_url = args[i];
         }
+    }
+
+    if (!isAllowedApiUrl(api_url)) {
+        try stderr.writeAll("error: --api-url must use https:// (http:// is allowed only for localhost/loopback)\n");
+        return 2;
     }
 
     const tok_str = token_raw orelse {
@@ -206,6 +212,20 @@ fn runSpecCmd(args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.
         telegram.bot.methods.method_count,
     });
     return 0;
+}
+
+/// The bot token travels in the URL path, so plain HTTP is accepted only for a
+/// loopback `telegram-bot-api --local` server.
+pub fn isAllowedApiUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return true;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
+    const host_component = uri.host orelse return false;
+    var host_buf: [256]u8 = undefined;
+    const host = host_component.toRaw(&host_buf) catch return false;
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "::1") or std.mem.eql(u8, host, "[::1]")) return true;
+    const ip4 = std.Io.net.Ip4Address.parse(host, 0) catch return false;
+    return ip4.bytes[0] == 127;
 }
 
 fn runMtprotoCmd(

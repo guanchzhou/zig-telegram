@@ -2,7 +2,8 @@
 //! - AES-256-IGE (Infinite Garble Extension) built on `std.crypto.core.aes.Aes256`
 //! - MTProto 2.0 `msg_key` SHA-256 derivation & constant-time verification
 //! - `auth_key_id` (lower 64 bits of `SHA1(auth_key)`)
-//! - Diffie-Hellman step 1 `pq` 64-bit semiprime factorization (Pollard's rho)
+//! - `pq` 64-bit semiprime factorization (Pollard's rho) for the DH handshake
+//!   proof of work; the DH exchange itself is not implemented
 
 const std = @import("std");
 const Aes256 = std.crypto.core.aes.Aes256;
@@ -177,19 +178,28 @@ pub fn verifyMsgKeyConstantTime(
     }
 }
 
+/// Upper bound on Pollard rho steps across all polynomial constants. A genuine
+/// `pq` (two primes below 2^32) needs on the order of 2^16 steps.
+const max_rho_steps: u64 = 1 << 24;
+
 /// Factors a 64-bit semiprime `pq = p * q` into `(min(p, q), max(p, q))` using
 /// Brent's cycle-finding Pollard's rho algorithm for the MTProto DH key exchange
 /// proof-of-work step (`req_DH_params`).
+///
+/// Rejects `pq >= 2^63`, primes (deterministic Miller-Rabin), factorizations
+/// with a factor of 2^32 or more, and inputs that exceed the step budget.
 pub fn factorizePq(pq: u64) CryptoError!struct { p: u32, q: u32 } {
-    if (pq <= 3) return error.FactorizationFailed;
+    if (pq <= 3 or pq >= (1 << 63)) return error.FactorizationFailed;
+    if (isPrime(pq)) return error.FactorizationFailed;
     if (pq % 2 == 0) {
         const other = pq / 2;
         if (other > std.math.maxInt(u32)) return error.FactorizationFailed;
         return .{ .p = 2, .q = @intCast(other) };
     }
 
+    var budget: u64 = max_rho_steps;
     var c: u64 = 1;
-    while (c < 64) : (c += 1) {
+    while (c < 64 and budget > 0) : (c += 1) {
         var y: u64 = 2;
         var r: u64 = 1;
         var q_prod: u64 = 1;
@@ -197,22 +207,24 @@ pub fn factorizePq(pq: u64) CryptoError!struct { p: u32, q: u32 } {
         var x: u64 = 2;
         var ys: u64 = 2;
 
-        while (g == 1) {
+        while (g == 1 and budget > 0) {
             x = y;
             var i: u64 = 0;
-            while (i < r) : (i += 1) {
+            while (i < r and budget > 0) : (i += 1) {
                 y = pollardStep(y, c, pq);
+                budget -= 1;
             }
             var k: u64 = 0;
-            while (k < r and g == 1) {
+            while (k < r and g == 1 and budget > 0) {
                 ys = y;
-                const lim = @min(128, r - k);
+                const lim = @min(128, r - k, budget);
                 var j: u64 = 0;
                 while (j < lim) : (j += 1) {
                     y = pollardStep(y, c, pq);
                     const diff = if (x > y) x - y else y - x;
-                    q_prod = @intCast((@as(u128, q_prod) * @as(u128, diff)) % pq);
+                    q_prod = mulMod(q_prod, diff, pq);
                 }
+                budget -= lim;
                 g = std.math.gcd(q_prod, pq);
                 k += 128;
             }
@@ -220,7 +232,8 @@ pub fn factorizePq(pq: u64) CryptoError!struct { p: u32, q: u32 } {
         }
 
         if (g == pq) {
-            while (true) {
+            g = 1;
+            while (budget > 0) : (budget -= 1) {
                 ys = pollardStep(ys, c, pq);
                 const diff = if (x > ys) x - ys else ys - x;
                 g = std.math.gcd(diff, pq);
@@ -235,9 +248,49 @@ pub fn factorizePq(pq: u64) CryptoError!struct { p: u32, q: u32 } {
             if (p_val <= std.math.maxInt(u32) and q_val <= std.math.maxInt(u32)) {
                 return .{ .p = @intCast(p_val), .q = @intCast(q_val) };
             }
+            return error.FactorizationFailed;
         }
     }
     return error.FactorizationFailed;
+}
+
+fn mulMod(a: u64, b: u64, m: u64) u64 {
+    return @intCast((@as(u128, a) * @as(u128, b)) % m);
+}
+
+fn powMod(base: u64, exp: u64, m: u64) u64 {
+    var result: u64 = 1;
+    var b = base % m;
+    var e = exp;
+    while (e > 0) : (e >>= 1) {
+        if (e & 1 == 1) result = mulMod(result, b, m);
+        b = mulMod(b, b, m);
+    }
+    return result;
+}
+
+/// Deterministic Miller-Rabin for all 64-bit `n` using the first 12 prime bases.
+pub fn isPrime(n: u64) bool {
+    const bases = [_]u64{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
+    if (n < 2) return false;
+    for (bases) |p| {
+        if (n == p) return true;
+        if (n % p == 0) return false;
+    }
+    var d = n - 1;
+    var s: u6 = 0;
+    while (d & 1 == 0) : (s += 1) d >>= 1;
+    witness: for (bases) |a| {
+        var x = powMod(a, d, n);
+        if (x == 1 or x == n - 1) continue;
+        var i: u6 = 1;
+        while (i < s) : (i += 1) {
+            x = mulMod(x, x, n);
+            if (x == n - 1) continue :witness;
+        }
+        return false;
+    }
+    return true;
 }
 
 fn pollardStep(x: u64, c: u64, mod: u64) u64 {
@@ -286,4 +339,34 @@ test "Telegram DH pq semiprime factorization" {
     const res = try factorizePq(0x17ED48941A08F981);
     try std.testing.expectEqual(@as(u32, 0x494C553B), res.p);
     try std.testing.expectEqual(@as(u32, 0x53911073), res.q);
+}
+
+test "factorizePq rejects a 63-bit prime without hanging" {
+    // 2^63 - 25 is prime.
+    try std.testing.expect(isPrime(9223372036854775783));
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(9223372036854775783));
+}
+
+test "factorizePq rejects pq >= 2^63 and factors of 2^32 or more" {
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(1 << 63));
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(std.math.maxInt(u64)));
+    // 3 * (2^61 - 1): the large factor does not fit in u32.
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(3 * 2305843009213693951));
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(2 * (1 << 40)));
+}
+
+test "factorizePq factors a small semiprime" {
+    const res = try factorizePq(999983 * 1000003);
+    try std.testing.expectEqual(@as(u32, 999983), res.p);
+    try std.testing.expectEqual(@as(u32, 1000003), res.q);
+}
+
+test "isPrime on small and composite inputs" {
+    try std.testing.expect(!isPrime(0));
+    try std.testing.expect(!isPrime(1));
+    try std.testing.expect(isPrime(2));
+    try std.testing.expect(isPrime(37));
+    try std.testing.expect(!isPrime(999983 * 1000003));
+    try std.testing.expect(isPrime(2305843009213693951));
+    try std.testing.expect(!isPrime(0x17ED48941A08F981));
 }

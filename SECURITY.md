@@ -50,5 +50,11 @@ shasum -a 256 -c SHA256SUMS
   reject or escape CR, LF, and quote characters to prevent multipart header
   injection.
 - **MTProto 2.0 `msg_key` verification**: Incoming MTProto 2.0 frames verify the
-  full SHA-256 `msg_key` in constant time and validate padding length alignment
-  (12..1024 bytes) before exposing plaintext to the TL decoder.
+  full SHA-256 `msg_key` in constant time and validate body alignment and padding
+  length (12..1024 bytes) before exposing plaintext to the TL decoder; all of these
+  failures return the same `error.DecryptionFailed`. Authenticated messages are
+  then checked for `session_id`, server `msg_id` parity, a +30 s/−300 s window
+  against the server clock, and replayed `msg_id`s. Decrypted plaintext buffers
+  are zeroed before they are freed.
+- **No DH key exchange**: `auth_key` creation is not implemented; callers supply
+  an existing key.

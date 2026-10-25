@@ -2,6 +2,54 @@
 
 All notable changes to `zig-telegram` are documented in this file.
 
+## [0.1.1] - 2026-10-25
+
+### Security
+
+- `Session.decryptMessage` now takes `*Session` and the current Unix time and
+  rejects body lengths that are not a multiple of 4, padding outside
+  12..1024 bytes, `session_id` mismatches, server `msg_id`s with the wrong
+  parity, `msg_id`s more than 30 s ahead of or 300 s behind the server clock
+  (`Session.syncServerTime` stores the offset), and `msg_id`s replayed within
+  the last 64 accepted messages. `msg_key` and length/padding failures all
+  return `error.DecryptionFailed`.
+- `Session.encryptMessage` pads with a random length in 12..1024 bytes and
+  rejects bodies that are not 4-byte aligned. Padding and the Obfuscated2
+  header come from `io.randomSecure`, and its errors are returned
+  (`Obfuscated2.initClient` now returns an error union).
+- Decrypted MTProto plaintext buffers are zeroed before they are freed.
+- `factorizePq` rejects `pq >= 2^63`, primes (deterministic Miller-Rabin), and
+  factors of 2^32 or more, and caps Pollard rho work; a 63-bit prime used to
+  hang it.
+- `TlReader.readVectorLen(min_elem_size)` rejects vector counts that cannot
+  fit in the remaining input.
+- `HttpTransport` retries only bodiless GET requests after a connection error;
+  POST requests are no longer replayed.
+- `LocalServerConfig.resolveLocalFilePath` rejects `..` components and NUL
+  bytes and requires paths inside the configured files directory
+  (`error.InvalidFilePath`).
+- `SecretToken.initValidated` limits the secret part to `[A-Za-z0-9_-]`,
+  `callRawJson` rejects method names outside `[A-Za-z0-9]+`
+  (`error.InvalidMethodName`), and the CLI refuses a non-HTTPS `--api-url`
+  unless the host is loopback.
+- `TdjsonClient.deinit` no longer unloads `libtdjson`, which crashed processes
+  whose TDLib threads were still running.
+
+### Changed
+
+- `transport.encodeFrame` takes an `io` argument; `.padded_intermediate`
+  frames now carry 0..15 random padding bytes, and `decodeFrame` strips them.
+- Obfuscated2 AES-256-CTR keeps its key schedule and produces 16-byte
+  keystream blocks instead of re-expanding the key per byte (same output).
+- `Poller` backoff is bounded Fibonacci with each delay jittered to 50–100%.
+
+### Fixed
+
+- README: the Diffie-Hellman key exchange is not implemented, callers must
+  supply an existing `auth_key`; corrected the backoff description, the
+  `LocalServerConfig` field names, the MTProto example, and the CLI
+  `mtproto` example.
+
 ## [0.1.0] - 2026-10-20
 
 ### Added

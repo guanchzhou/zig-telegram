@@ -1,5 +1,5 @@
 //! Long-polling update loop (`getUpdates`) with automatic `offset` advancement,
-//! HTTP 429 `retry_after` compliance, Fibonacci backoff on transient failures,
+//! HTTP 429 `retry_after` compliance, jittered Fibonacci backoff on transient failures,
 //! and per-batch arena memory management.
 
 const std = @import("std");
@@ -85,6 +85,13 @@ pub const Poller = struct {
         return @min(a, self.config.max_backoff_ms);
     }
 
+    /// Spreads retries of many pollers: maps `delay_ms` to a value in
+    /// `[delay_ms / 2, delay_ms]` chosen by `rand`.
+    pub fn applyJitter(delay_ms: u64, rand: u64) u64 {
+        const half = delay_ms / 2;
+        return half + rand % (delay_ms - half + 1);
+    }
+
     /// Runs the polling loop until `stop()` is called or `max_batches` is
     /// reached (when non-null).
     ///
@@ -114,7 +121,12 @@ pub const Poller = struct {
                     continue;
                 },
                 else => {
-                    const delay_ms = self.computeBackoffMs(self.consecutive_failures);
+                    var rand: [8]u8 = undefined;
+                    self.client.io.random(&rand);
+                    const delay_ms = applyJitter(
+                        self.computeBackoffMs(self.consecutive_failures),
+                        std.mem.readInt(u64, &rand, .little),
+                    );
                     self.consecutive_failures +|= 1;
                     self.sleepMs(delay_ms);
                     continue;
@@ -176,4 +188,15 @@ test "Poller advances offset and honors 429 retry_after" {
     try std.testing.expectEqual(@as(?i64, 106), poller.next_offset);
     // Verify second request sent `"offset":106`
     try std.testing.expect(std.mem.indexOf(u8, mock.recorded.items[1].body.?, "\"offset\":106") != null);
+}
+
+test "applyJitter stays within half to full delay" {
+    try std.testing.expectEqual(@as(u64, 0), Poller.applyJitter(0, 12345));
+    var r: u64 = 0;
+    while (r < 5000) : (r += 37) {
+        const d = Poller.applyJitter(1000, r *% 0x9E3779B97F4A7C15);
+        try std.testing.expect(d >= 500 and d <= 1000);
+    }
+    try std.testing.expectEqual(@as(u64, 500), Poller.applyJitter(1000, 0));
+    try std.testing.expectEqual(@as(u64, 1000), Poller.applyJitter(1000, 500));
 }

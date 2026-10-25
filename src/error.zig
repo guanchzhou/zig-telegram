@@ -36,6 +36,10 @@ pub const TelegramError = error{
     InvalidMultipartHeader,
     /// Requested local file could not be read
     FileReadError,
+    /// Local server `file_path` contains `..` or lies outside the configured files directory
+    InvalidFilePath,
+    /// Bot API method name is not `[A-Za-z0-9]+`
+    InvalidMethodName,
     /// Out of memory
     OutOfMemory,
 };

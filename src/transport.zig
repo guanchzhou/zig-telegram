@@ -6,8 +6,9 @@
 //! - Preserves `keep_alive = true` across requests so `std.http.Client`'s
 //!   connection pool reuses TLS 1.3 sessions instead of paying a TCP + TLS
 //!   handshake on every Bot API call.
-//! - Retains a replayable request payload buffer so stale pooled connections
-//!   closed by the server mid-flight can be retried once transparently.
+//! - Retries a bodiless (GET) request once when a stale pooled connection was
+//!   closed by the server; POST requests are never retried because the server
+//!   may already have acted on them.
 //! - Enforces a strict `max_response_bytes` cap before allocating response buffers.
 
 const std = @import("std");
@@ -31,18 +32,40 @@ pub const LocalServerConfig = struct {
     /// Optional host directory mapped to `server_files_dir` (e.g. `"/srv/tg-files"`).
     host_files_dir: ?[]const u8 = null,
 
+    pub const PathError = error{ OutOfMemory, InvalidFilePath };
+
     /// Remaps a `File.file_path` returned by a `--local` server to the host
     /// filesystem path. Caller owns the returned slice.
-    pub fn resolveLocalFilePath(self: LocalServerConfig, allocator: Allocator, file_path: []const u8) Allocator.Error![]u8 {
-        if (self.server_files_dir) |srv_prefix| {
-            if (self.host_files_dir) |host_prefix| {
-                if (std.mem.startsWith(u8, file_path, srv_prefix)) {
-                    const suffix = file_path[srv_prefix.len..];
-                    return std.fmt.allocPrint(allocator, "{s}{s}", .{ host_prefix, suffix });
-                }
-            }
+    ///
+    /// Rejects paths containing NUL or a `..` component. When
+    /// `server_files_dir` is set, `file_path` must lie inside it (prefix + `/`)
+    /// and is remapped onto `host_files_dir` (or kept as is when that is null).
+    /// When only `host_files_dir` is set, `file_path` must lie inside it.
+    pub fn resolveLocalFilePath(self: LocalServerConfig, allocator: Allocator, file_path: []const u8) PathError![]u8 {
+        if (std.mem.indexOfScalar(u8, file_path, 0) != null) return error.InvalidFilePath;
+        var it = std.mem.splitAny(u8, file_path, "/\\");
+        while (it.next()) |component| {
+            if (std.mem.eql(u8, component, "..")) return error.InvalidFilePath;
+        }
+
+        if (self.server_files_dir) |srv_dir| {
+            const suffix = pathInside(file_path, srv_dir) orelse return error.InvalidFilePath;
+            const host_dir = self.host_files_dir orelse return allocator.dupe(u8, file_path);
+            return std.fmt.allocPrint(allocator, "{s}{s}", .{ std.mem.trimEnd(u8, host_dir, "/"), suffix });
+        }
+        if (self.host_files_dir) |host_dir| {
+            _ = pathInside(file_path, host_dir) orelse return error.InvalidFilePath;
         }
         return allocator.dupe(u8, file_path);
+    }
+
+    /// Returns the `/...` remainder of `path` when it lies strictly inside `dir`.
+    fn pathInside(path: []const u8, dir: []const u8) ?[]const u8 {
+        const prefix = std.mem.trimEnd(u8, dir, "/");
+        if (!std.mem.startsWith(u8, path, prefix)) return null;
+        const rest = path[prefix.len..];
+        if (rest.len < 2 or rest[0] != '/') return null;
+        return rest;
     }
 
     /// Formats a local host file path as a `file://` URI accepted by a local
@@ -54,6 +77,15 @@ pub const LocalServerConfig = struct {
         return std.fmt.allocPrint(allocator, "file://{s}", .{abs_path});
     }
 };
+
+/// Bot API method names are plain identifiers such as `sendMessage`.
+pub fn isValidMethodName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return false;
+    }
+    return true;
+}
 
 /// Raw HTTP request passed to a `Transport` implementation.
 pub const RawRequest = struct {
@@ -161,11 +193,11 @@ const BoundedWriter = struct {
 };
 
 /// Production HTTP/HTTPS transport backed by `std.http.Client` with persistent
-/// keep-alive connection pooling and automatic single-retry on stale pooled
-/// connection reset.
+/// keep-alive connection pooling and a single retry of bodiless (GET)
+/// requests on stale pooled connection reset.
 pub const HttpTransport = struct {
     http_client: std.http.Client,
-    user_agent: []const u8 = "zig-telegram/0.1.0",
+    user_agent: []const u8 = "zig-telegram/0.1.1",
 
     pub fn init(allocator: Allocator, io: std.Io) HttpTransport {
         return .{
@@ -193,12 +225,17 @@ pub const HttpTransport = struct {
 
     fn sendImpl(ptr: *anyopaque, allocator: Allocator, req: RawRequest) TelegramError!RawResponse {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
-        // Attempt up to 2 times in case a pooled keep-alive connection was
-        // closed by the remote peer right before our write.
+        // A pooled keep-alive connection may have been closed by the peer right
+        // before our write. std.http.Client cannot report whether the request
+        // reached the server, so only idempotent GETs are retried.
         return self.executeOnce(allocator, req) catch |first_err| switch (first_err) {
-            error.TransportError => self.executeOnce(allocator, req),
+            error.TransportError => if (shouldRetry(req)) self.executeOnce(allocator, req) else first_err,
             else => return first_err,
         };
+    }
+
+    fn shouldRetry(req: RawRequest) bool {
+        return req.body == null;
     }
 
     fn executeOnce(self: *HttpTransport, allocator: Allocator, req: RawRequest) TelegramError!RawResponse {
@@ -370,4 +407,52 @@ test "LocalServerConfig path remapping and file:// URI" {
     const uri = try LocalServerConfig.formatFileUri(allocator, mapped);
     defer allocator.free(uri);
     try std.testing.expectEqualStrings("file:///data/tg-local/123:ABC/videos/file_1.mp4", uri);
+}
+
+test "LocalServerConfig rejects path traversal and paths outside the files dir" {
+    const allocator = std.testing.allocator;
+    const cfg = LocalServerConfig{
+        .server_files_dir = "/var/lib/telegram-bot-api/",
+        .host_files_dir = "/data/tg-local",
+    };
+    const bad = [_][]const u8{
+        "/var/lib/telegram-bot-api/123:ABC/../../../../etc/passwd",
+        "/var/lib/telegram-bot-api/..",
+        "/var/lib/telegram-bot-api-evil/123/file.mp4",
+        "/var/lib/telegram-bot-api",
+        "/var/lib/telegram-bot-api/",
+        "/etc/passwd",
+        "/var/lib/telegram-bot-api/a\x00b",
+    };
+    for (bad) |p| {
+        try std.testing.expectError(error.InvalidFilePath, cfg.resolveLocalFilePath(allocator, p));
+    }
+
+    const ok = try cfg.resolveLocalFilePath(allocator, "/var/lib/telegram-bot-api/123:ABC/a..b/file.mp4");
+    defer allocator.free(ok);
+    try std.testing.expectEqualStrings("/data/tg-local/123:ABC/a..b/file.mp4", ok);
+
+    const host_only = LocalServerConfig{ .host_files_dir = "/srv/tg" };
+    try std.testing.expectError(error.InvalidFilePath, host_only.resolveLocalFilePath(allocator, "/srv/tg-other/x"));
+    const inside = try host_only.resolveLocalFilePath(allocator, "/srv/tg/x");
+    defer allocator.free(inside);
+    try std.testing.expectEqualStrings("/srv/tg/x", inside);
+}
+
+test "HttpTransport retries only bodiless requests" {
+    try std.testing.expect(HttpTransport.shouldRetry(.{ .url = "https://api.telegram.org/botX/getMe" }));
+    try std.testing.expect(!HttpTransport.shouldRetry(.{
+        .url = "https://api.telegram.org/botX/sendMessage",
+        .content_type = "application/json",
+        .body = "{}",
+    }));
+}
+
+test "isValidMethodName" {
+    try std.testing.expect(isValidMethodName("sendMessage"));
+    try std.testing.expect(isValidMethodName("getMe"));
+    try std.testing.expect(!isValidMethodName(""));
+    try std.testing.expect(!isValidMethodName("../getMe"));
+    try std.testing.expect(!isValidMethodName("getMe?x=1"));
+    try std.testing.expect(!isValidMethodName("send_message"));
 }

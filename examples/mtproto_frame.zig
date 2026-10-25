@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
     // 3. Frame with MTProto Intermediate transport
     const wire_frame = try telegram.mtproto.transport.encodeFrame(
         allocator,
+        io,
         .intermediate,
         encrypted_packet,
     );
@@ -46,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
         wire_frame,
         telegram.mtproto.transport.default_max_frame_bytes,
     );
-    var decrypted = try session.decryptMessage(allocator, .client_to_server, unframed.payload);
+    var decrypted = try session.decryptMessage(allocator, .client_to_server, unframed.payload, 1_730_000_000);
     defer decrypted.deinit(allocator);
 
     var tl_reader = telegram.mtproto.TlReader.init(decrypted.body);

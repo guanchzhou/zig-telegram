@@ -649,6 +649,7 @@ fn generateClientFile(
         \\        method_name: []const u8,
         \\        json_body: ?[]const u8,
         \\    ) TelegramError!transport_mod.RawResponse {{
+        \\        if (!transport_mod.isValidMethodName(method_name)) return error.InvalidMethodName;
         \\        const url = try self.buildMethodUrl(allocator, method_name);
         \\        defer allocator.free(url);
         \\        const trimmed = if (json_body) |b| std.mem.trim(u8, b, " \t\r\n") else null;

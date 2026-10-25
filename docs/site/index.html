@@ -13,7 +13,7 @@
       <a href="#" class="brand">
         <span class="brand-mark">ZT</span>
         <span>zig-telegram</span>
-        <span class="brand-tag">v0.1.0 · Zig 0.17.0</span>
+        <span class="brand-tag">v0.1.1 · Zig 0.17.0</span>
       </a>
       <nav class="nav-links">
         <a href="#architecture">Architecture</a>
@@ -362,15 +362,15 @@
     0x1122334455667788,
 );
 
-<span class="c-kw">const</span> encrypted = <span class="c-kw">try</span> session.encryptPacket(
+<span class="c-kw">const</span> packet = <span class="c-kw">try</span> session.encryptMessage(
     allocator,
-    tl_payload,
-    unix_time_sec,
-    <span class="c-kw">true</span>,
+    io,
     .client_to_server,
-    random_pad,
+    session.nextMsgId(now_unix_ns),
+    session.nextSeqNo(<span class="c-kw">true</span>),
+    tl_payload,
 );
-<span class="c-kw">defer</span> allocator.free(encrypted.packet);</code></pre>
+<span class="c-kw">defer</span> allocator.free(packet);</code></pre>
         </div>
       </div>
 
@@ -380,8 +380,8 @@
           <pre class="terminal-body"><code>$ zig build run -- spec
 Telegram Bot API 10.3 (August 24, 2026) — 185 methods
 
-$ zig build run -- mtproto
-MTProto 2.0 Self-Test: OK (auth_key_id=0x..., msg_id=0x..., packet=64 bytes, factorizePq(0x17ED48941A08F981)=0x494C553B * 0x53911073)
+$ zig build run -- mtproto factor-pq --pq 0x17ED48941A08F981
+{"pq":1724114033281923457,"p":1229739323,"q":1402015859}
 
 $ TELEGRAM_BOT_TOKEN="123456:ABC-DEF" zig build run -- send --chat 42 --text "Deployed!"</code></pre>
         </div>

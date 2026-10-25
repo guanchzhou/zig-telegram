@@ -12,14 +12,15 @@
    - **100% of Telegram Bot API 10.3** (August 24, 2026 — **185 methods** and **400 types/unions**), deterministically generated from [`spec/bot_api_10_3.json`](spec/bot_api_10_3.json) via [`tools/gen_bot_api.zig`](tools/gen_bot_api.zig) (`zig build gen-spec` / `zig build spec-check`).
    - **Recursive `attach://` Multipart Engine**: Comptime + runtime inspection across nested structs, optionals, slices, and unions (`sendMediaGroup`, `sendPaidMedia`, `editMessageMedia`, `sendPoll`, `sendRichMessage`), automatically rewriting nested `.path` and `.bytes` `InputFile` fields into `"attach://part_<n>"` JSON references and streaming RFC 7578 binary parts with 128-bit CSPRNG boundaries.
    - **Single-Pass Discriminated Unions**: All 23 Bot API discriminated unions (`MaybeInaccessibleMessage`, `ChatMember`, `MessageOrigin`, `ReactionType`, `BackgroundFill`, `BackgroundType`, `RevenuePartner`, `TransactionPartner`, `PaidMedia`, `StoryAreaType`, `OwnedGift`, `BotCommandScope`, `MenuButton`, `InputMedia`, `InputPaidMedia`, `InputProfilePhoto`, `InputStoryContent`, `RichText`, etc.) parse in a single pass without intermediate `std.json.Value` DOM allocations.
-   - **Persistent Keep-Alive HTTP Transport + MockTransport**: Built on `std.http.Client` with TLS 1.3 connection pooling, single automatic retry on stale keep-alive reset, bounded response reader (`error.ResponseTooLarge`), and `--local` Bot API server `file://` path remapping.
+   - **Persistent Keep-Alive HTTP Transport + MockTransport**: Built on `std.http.Client` with TLS 1.3 connection pooling, a single automatic retry of bodiless GET requests on stale keep-alive reset (POSTs are never replayed), bounded response reader (`error.ResponseTooLarge`), and `--local` Bot API server `file://` path remapping.
    - **Caller-Owned `ErrorDetail` Diagnostics**: Every `BotClient` method accepts `err_out: ?*?ErrorDetail`, preserving `error_code`, `description`, `retry_after` (429 rate-limit backoff), and `migrate_to_chat_id` without thread-unsafe mutable client state.
-   - **Bot Runtime Utilities**: Resilient `Poller` (automatic `offset = last_update_id + 1`, `429 Retry-After` sleep, exponential jitter backoff), constant-time `WebhookProcessor` (`X-Telegram-Bot-Api-Secret-Token` verified via SHA-256 + `std.crypto.timing_safe.eql`), and comptime `Router(Context, routes)`.
+   - **Bot Runtime Utilities**: Resilient `Poller` (automatic `offset = last_update_id + 1`, `429 Retry-After` sleep, bounded Fibonacci backoff with each delay jittered to 50–100%), constant-time `WebhookProcessor` (`X-Telegram-Bot-Api-Secret-Token` verified via SHA-256 + `std.crypto.timing_safe.eql`), and comptime `Router(Context, routes)`.
 2. **Plane 2 — `telegram.mtproto` (Pure-Zig MTProto 2.0 Core)**:
    - **TL Binary Codec (`mtproto.tl`)**: 32-bit constructor IDs, 24-bit/56-bit length-prefixed strings and byte arrays with 4-byte padding alignment, `Int128`/`Int256`, and `Vector<T>`.
-   - **Pure-Zig MTProto 2.0 Cryptography (`mtproto.crypto`)**: AES-256-IGE (Infinite Garble Extension) built directly on `std.crypto.core.aes.Aes256`, MTProto 2.0 SHA-256 `msg_key` and `aes_key`/`aes_iv` KDF, and Brent–Pollard $\rho$ `pq` prime factorization for Diffie-Hellman key exchange.
+   - **Pure-Zig MTProto 2.0 Cryptography (`mtproto.crypto`)**: AES-256-IGE (Infinite Garble Extension) built directly on `std.crypto.core.aes.Aes256`, MTProto 2.0 SHA-256 `msg_key` and `aes_key`/`aes_iv` KDF, and Brent–Pollard $\rho$ `pq` factorization (the proof-of-work step of the DH handshake; primes, inputs ≥ 2^63, and factors ≥ 2^32 are rejected).
    - **Transport Framing (`mtproto.transport`)**: Abridged (`0xef`), Intermediate (`0xeeeeeeee`), Padded Intermediate (`0xdddddddd`), and Obfuscated2 (64-byte header + dual CTR keystreams).
-   - **Session Framing (`mtproto.session`)**: Unencrypted handshake envelopes and encrypted MTProto 2.0 packets with 12..1024-byte random padding and monotonic time-synchronized 64-bit `msg_id` + `seq_no` state.
+   - **Session Framing (`mtproto.session`)**: Unencrypted handshake envelopes and encrypted MTProto 2.0 packets with CSPRNG padding of random length (12..1024 bytes), monotonic 64-bit `msg_id` + `seq_no` state, and incoming-message checks for `session_id`, `msg_id` parity, a +30 s/−300 s time window against the server clock, and replayed `msg_id`s.
+   - **No DH key exchange yet**: the `auth_key` creation handshake (`req_pq_multi` → `req_DH_params` → `set_client_DH_params`) is not implemented. Callers must supply an existing 256-byte `auth_key` (for example exported from a TDLib session).
 3. **Plane 3 — `telegram.tdlib` (Optional TDLib `tdjson` Bridge)**:
    - Zero-cost runtime dynamic loader (`std.DynLib`) and mockable C ABI vtable for `libtdjson` (`td_create_client_id`, `td_send`, `td_receive`, `td_execute`) — requiring **zero C/C++ dependencies** by default.
 
@@ -154,8 +155,8 @@ defer parsed_update.deinit();
 var client = telegram.bot.BotClient.init(allocator, io, token, http.transport(), .{
     .local_server = .{
         .base_url = "http://127.0.0.1:8081",
-        .server_data_dir = "/var/lib/telegram-bot-api",
-        .host_data_dir = "/mnt/telegram-data",
+        .server_files_dir = "/var/lib/telegram-bot-api",
+        .host_files_dir = "/mnt/telegram-data",
     },
 });
 ```
@@ -165,21 +166,20 @@ var client = telegram.bot.BotClient.init(allocator, io, token, http.transport(),
 ```zig
 const mtproto = telegram.mtproto;
 
-const auth_key: [256]u8 = @splat(0x42);
-var session = mtproto.session.Session.init(auth_key, 0x0102030405060708, 0x1122334455667788);
+// The DH handshake is not implemented: `auth_key` must come from an existing session.
+const auth_key: [256]u8 = existing_auth_key;
+var session = mtproto.session.Session.init(auth_key, server_salt, session_id);
 
-const encrypted = try session.encryptPacket(
-    allocator,
-    tl_payload,
-    1_729_420_000,
-    true,
-    .client_to_server,
-    @splat(0x7F),
-);
-defer allocator.free(encrypted.packet);
+const msg_id = session.nextMsgId(now_unix_ns);
+const packet = try session.encryptMessage(allocator, io, .client_to_server, msg_id, session.nextSeqNo(true), tl_payload);
+defer allocator.free(packet);
 
-const framed = try mtproto.transport.encodeFrame(allocator, .intermediate, encrypted.packet);
+const framed = try mtproto.transport.encodeFrame(allocator, io, .intermediate, packet);
 defer allocator.free(framed);
+
+// Incoming server packets: rejects bad msg_key, session_id, msg_id parity/time, and replays.
+var msg = try session.decryptMessage(allocator, .server_to_client, server_packet, now_unix_s);
+defer msg.deinit(allocator);
 ```
 
 ---
@@ -192,8 +192,8 @@ Build or run the bundled CLI:
 # Print Bot API 10.3 specification coverage
 zig build run -- spec
 
-# Run MTProto 2.0 self-test (AES-256-IGE + SHA-256 msg_key + pq factorization)
-zig build run -- mtproto
+# Factor an MTProto DH pq value
+zig build run -- mtproto factor-pq --pq 0x17ED48941A08F981
 
 # Call getMe
 TELEGRAM_BOT_TOKEN="123456:ABC-DEF" zig build run -- me

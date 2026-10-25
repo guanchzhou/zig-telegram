@@ -61,11 +61,13 @@ pub const TdjsonClient = struct {
         };
     }
 
+    /// Releases the wrapper. The dynamically loaded library is deliberately
+    /// never unloaded: TDLib keeps internal threads running after the last
+    /// client is closed, and unmapping their code would crash the process.
+    /// Send `{"@type":"close"}` and wait for `authorizationStateClosed` before
+    /// dropping the client.
     pub fn deinit(self: *TdjsonClient) void {
-        if (self.dyn_lib) |*lib| {
-            lib.close();
-            self.dyn_lib = null;
-        }
+        self.dyn_lib = null;
     }
 
     /// Asynchronously sends a null-terminated JSON TDLib request to `self.client_id`.
@@ -75,12 +77,18 @@ pub const TdjsonClient = struct {
 
     /// Receives the next incoming TDLib JSON event or response, waiting up to
     /// `timeout_seconds`. Returns `null` on timeout.
+    ///
+    /// The returned slice is owned by TDLib and is valid only until the next
+    /// `receive` or `execute` call on any thread; copy it to keep it.
     pub fn receive(self: *const TdjsonClient, timeout_seconds: f64) ?[]const u8 {
         const ptr = self.binding.td_receive(timeout_seconds) orelse return null;
         return std.mem.span(ptr);
     }
 
     /// Synchronously executes a TDLib JSON method (such as `getTextEntities` or `setLogVerbosityLevel`).
+    ///
+    /// The returned slice is owned by TDLib and is valid only until the next
+    /// `receive` or `execute` call on any thread; copy it to keep it.
     pub fn execute(self: *const TdjsonClient, request_json: [:0]const u8) ?[]const u8 {
         const ptr = self.binding.td_execute(request_json.ptr) orelse return null;
         return std.mem.span(ptr);

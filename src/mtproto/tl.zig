@@ -30,6 +30,7 @@ pub const TlError = error{
     InvalidBoolConstructor,
     InvalidVectorConstructor,
     StringTooLarge,
+    VectorTooLarge,
     OutOfMemory,
 };
 
@@ -245,6 +246,16 @@ pub const TlReader = struct {
         if (tag != vector_constructor_id) return error.InvalidVectorConstructor;
         return self.readU32();
     }
+
+    /// Like `beginVector`, but rejects counts whose elements could not fit in
+    /// the remaining input given each element occupies at least
+    /// `min_elem_size` bytes. Use before allocating `count` elements.
+    pub fn readVectorLen(self: *TlReader, min_elem_size: usize) TlError!u32 {
+        const count = try self.beginVector();
+        const needed = std.math.mul(usize, count, min_elem_size) catch return error.VectorTooLarge;
+        if (needed > self.remaining()) return error.VectorTooLarge;
+        return count;
+    }
 };
 
 test "TL binary short and long string alignment and primitives round-trip" {
@@ -268,4 +279,25 @@ test "TL binary short and long string alignment and primitives round-trip" {
     try std.testing.expectEqualStrings("hello", try r.readBytes());
     try std.testing.expectEqualSlices(u8, &long_data, try r.readBytes());
     try std.testing.expectEqual(@as(usize, 0), r.remaining());
+}
+
+test "readVectorLen rejects counts larger than the remaining input" {
+    const allocator = std.testing.allocator;
+    var w = TlWriter.init(allocator);
+    defer w.deinit();
+    try w.beginVector(2);
+    try w.writeI64(1);
+    try w.writeI64(2);
+
+    var ok = TlReader.init(w.written());
+    try std.testing.expectEqual(@as(u32, 2), try ok.readVectorLen(8));
+
+    var too_wide = TlReader.init(w.written());
+    try std.testing.expectError(error.VectorTooLarge, too_wide.readVectorLen(9));
+
+    var hdr = TlWriter.init(allocator);
+    defer hdr.deinit();
+    try hdr.beginVector(std.math.maxInt(u32));
+    var huge = TlReader.init(hdr.written());
+    try std.testing.expectError(error.VectorTooLarge, huge.readVectorLen(4));
 }
