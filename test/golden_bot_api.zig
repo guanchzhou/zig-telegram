@@ -202,3 +202,117 @@ test "OOM resilience under std.testing.FailingAllocator" {
         }
     }
 }
+
+test "downloadFile and buildFileDownloadUrl reject path traversal and unsafe characters" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var mock = telegram.MockTransport.init(allocator);
+    defer mock.deinit();
+
+    const token = try telegram.SecretToken.initValidated("123456:AAH_download_test");
+    const client = telegram.BotClient.init(allocator, io, token, mock.transport(), .{});
+
+    const bad_paths = [_][]const u8{
+        "",
+        "/",
+        "///",
+        ".",
+        "..",
+        "./file.jpg",
+        "../etc/passwd",
+        "photos/../secret.jpg",
+        "photos/./file.jpg",
+        "photos//file.jpg",
+        "photos/",
+        "photos/file.jpg?foo=1",
+        "photos/file.jpg#frag",
+        "photos/%2e%2e/secret.jpg",
+        "photos\\secret.jpg",
+        "photos/file name.jpg",
+        "photos/file\tname.jpg",
+        "photos/file\r\n.jpg",
+        "photos/file\x00.jpg",
+        "photos/file\x1f.jpg",
+        "photos/file\x7f.jpg",
+    };
+
+    for (bad_paths) |p| {
+        try std.testing.expectError(error.InvalidFilePath, client.buildFileDownloadUrl(allocator, p));
+        try std.testing.expectError(error.InvalidFilePath, client.downloadFile(allocator, p));
+    }
+    try std.testing.expectEqual(@as(usize, 0), mock.recorded.items.len);
+
+    // Valid path succeeds.
+    try mock.pushResponse(200, "IMAGE_DATA");
+    const url = try client.buildFileDownloadUrl(allocator, "/photos/a..b/file_0.jpg");
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://api.telegram.org/file/bot123456:AAH_download_test/photos/a..b/file_0.jpg",
+        url,
+    );
+    const bytes = try client.downloadFile(allocator, "photos/a..b/file_0.jpg");
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("IMAGE_DATA", bytes);
+}
+
+test "downloadFile confines local_server reads against symlink escapes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "allowed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.txt", .data = "TOP_SECRET" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "allowed/inside.txt", .data = "SAFE_FILE" });
+    try tmp.dir.symLink(io, "../outside.txt", "allowed/escape.txt", .{});
+    try tmp.dir.symLink(io, "inside.txt", "allowed/good_link.txt", .{});
+
+    var allowed_real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const allowed_real_len = try tmp.dir.realPathFile(io, "allowed", &allowed_real_buf);
+    const allowed_real = allowed_real_buf[0..allowed_real_len];
+
+    var mock = telegram.MockTransport.init(allocator);
+    defer mock.deinit();
+    const token = try telegram.SecretToken.initValidated("123456:AAH_local_test");
+    const client = telegram.BotClient.init(allocator, io, token, mock.transport(), .{
+        .local_server = .{
+            .server_files_dir = "/srv/bot",
+            .host_files_dir = allowed_real,
+        },
+    });
+
+    // Normal file and in-bounds symlink succeed.
+    const inside = try client.downloadFile(allocator, "/srv/bot/inside.txt");
+    defer allocator.free(inside);
+    try std.testing.expectEqualStrings("SAFE_FILE", inside);
+
+    const good_link = try client.downloadFile(allocator, "/srv/bot/good_link.txt");
+    defer allocator.free(good_link);
+    try std.testing.expectEqualStrings("SAFE_FILE", good_link);
+
+    // Symlink escaping allowed_real must be rejected with InvalidFilePath.
+    try std.testing.expectError(error.InvalidFilePath, client.downloadFile(allocator, "/srv/bot/escape.txt"));
+}
+
+test "BotClient method URL stack buffer and heap fallback for long base_url" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var mock = telegram.MockTransport.init(allocator);
+    defer mock.deinit();
+    try mock.pushResponse(200, "{\"ok\":true,\"result\":true}");
+
+    // Base URL > 512 bytes exercises the heap-allocation fallback in formatMethodUrl.
+    const long_tail: [520]u8 = @splat('a');
+    const long_prefix = "https://example.com/" ++ long_tail;
+    const token = try telegram.SecretToken.initValidated("123456:AAH_long_url_test");
+    const client = telegram.BotClient.init(allocator, io, token, mock.transport(), .{
+        .base_url = long_prefix,
+    });
+    var res = try client.close(.{}, null);
+    defer res.deinit();
+    try std.testing.expect(res.value);
+    try std.testing.expect(std.mem.endsWith(u8, mock.recorded.items[0].url, "/bot123456:AAH_long_url_test/close"));
+}

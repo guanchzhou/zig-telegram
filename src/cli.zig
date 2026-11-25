@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 const telegram = @import("telegram");
 
 pub const usage_text =
-    \\zig-telegram 0.1.1 — Fast, memory-safe Telegram Bot API 10.3 & MTProto 2.0 CLI
+    \\zig-telegram 0.1.2 — Fast, memory-safe Telegram Bot API 10.3 & MTProto 2.0 CLI
     \\
     \\USAGE:
     \\  zig-telegram <command> [options]
@@ -215,14 +215,19 @@ fn runSpecCmd(args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.
 }
 
 /// The bot token travels in the URL path, so plain HTTP is accepted only for a
-/// loopback `telegram-bot-api --local` server.
+/// loopback `telegram-bot-api --local` server. Rejects missing host, userinfo,
+/// query strings, and fragments.
 pub fn isAllowedApiUrl(url: []const u8) bool {
     const uri = std.Uri.parse(url) catch return false;
-    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return true;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
     const host_component = uri.host orelse return false;
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) {
+        return false;
+    }
     var host_buf: [256]u8 = undefined;
     const host = host_component.toRaw(&host_buf) catch return false;
+    if (host.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return true;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
     if (std.ascii.eqlIgnoreCase(host, "localhost") or std.mem.eql(u8, host, "::1") or std.mem.eql(u8, host, "[::1]")) return true;
     const ip4 = std.Io.net.Ip4Address.parse(host, 0) catch return false;
     return ip4.bytes[0] == 127;
@@ -434,10 +439,32 @@ fn runPollCmd(
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--timeout")) {
             i += 1;
-            if (i < args.len) timeout = std.fmt.parseInt(i64, args[i], 10) catch 30;
+            if (i >= args.len) {
+                try stderr.writeAll("error: --timeout requires an integer value (0..3600)\n");
+                return 2;
+            }
+            timeout = std.fmt.parseInt(i64, args[i], 10) catch {
+                try stderr.writeAll("error: invalid --timeout integer (expected 0..3600)\n");
+                return 2;
+            };
+            if (timeout < 0 or timeout > 3600) {
+                try stderr.writeAll("error: --timeout out of range (expected 0..3600)\n");
+                return 2;
+            }
         } else if (std.mem.eql(u8, args[i], "--limit")) {
             i += 1;
-            if (i < args.len) limit = std.fmt.parseInt(i64, args[i], 10) catch 100;
+            if (i >= args.len) {
+                try stderr.writeAll("error: --limit requires an integer value (1..100)\n");
+                return 2;
+            }
+            limit = std.fmt.parseInt(i64, args[i], 10) catch {
+                try stderr.writeAll("error: invalid --limit integer (expected 1..100)\n");
+                return 2;
+            };
+            if (limit < 1 or limit > 100) {
+                try stderr.writeAll("error: --limit out of range (expected 1..100)\n");
+                return 2;
+            }
         } else if (std.mem.eql(u8, args[i], "--once")) {
             max_batches = 1;
         } else if (std.mem.eql(u8, args[i], "--token") or std.mem.eql(u8, args[i], "--api-url")) {
@@ -515,7 +542,15 @@ fn runFileCmd(
         const data = try client.downloadFile(allocator, remote_path);
         defer allocator.free(data);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = data });
-        try stdout.print("{{\"saved\":\"{s}\",\"bytes\":{d}}}\n", .{ dest, data.len });
+        const SavedSummary = struct {
+            saved: []const u8,
+            bytes: usize,
+        };
+        try std.json.Stringify.value(SavedSummary{
+            .saved = dest,
+            .bytes = data.len,
+        }, .{}, stdout);
+        try stdout.writeByte('\n');
     } else {
         const json_out = try telegram.json.stringifyAlloc(allocator, file_info.value);
         defer allocator.free(json_out);

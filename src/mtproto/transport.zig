@@ -86,13 +86,17 @@ pub fn encodeFrame(
 }
 
 /// Length of the MTProto packet at the start of `payload`, so the 0..15 bytes
-/// of padded-intermediate transport padding can be dropped: unencrypted
-/// packets carry `message_data_length`, encrypted ones are 24 + 16k bytes.
+/// of padded-intermediate transport padding can be dropped:
+/// - 4-byte transport error codes (+ 0..15 bytes padding -> total 4..19 bytes)
+/// - unencrypted packets carry `message_data_length` (`>= 20` bytes)
+/// - encrypted packets are `24 + 16k` bytes
 fn mtprotoPacketLen(payload: []const u8) ?usize {
-    if (payload.len < 8) return null;
+    if (payload.len < 4) return null;
+    if (payload.len < 20) return 4;
     if (std.mem.readInt(u64, payload[0..8], .little) == 0) {
-        if (payload.len < 20) return null;
-        const total = 20 + @as(usize, std.mem.readInt(u32, payload[16..20], .little));
+        const data_len: usize = std.mem.readInt(u32, payload[16..20], .little);
+        if (data_len % 4 != 0) return null;
+        const total = std.math.add(usize, 20, data_len) catch return null;
         return if (total <= payload.len) total else null;
     }
     if (payload.len < 24) return null;
@@ -113,7 +117,7 @@ pub fn decodeFrame(
     switch (mode) {
         .abridged => {
             if (buffer.len < 1) return error.IncompleteFrame;
-            const first = buffer[0];
+            const first = buffer[0] & 0x7f;
             var words: usize = 0;
             var hdr_len: usize = 0;
             if (first < 0x7f) {
@@ -126,12 +130,13 @@ pub fn decodeFrame(
                     (@as(usize, buffer[3]) << 16);
                 hdr_len = 4;
             }
-            const byte_len = words * 4;
+            const byte_len = std.math.mul(usize, words, 4) catch return error.PayloadTooLarge;
             if (byte_len > max_frame_bytes) return error.PayloadTooLarge;
-            if (buffer.len < hdr_len + byte_len) return error.IncompleteFrame;
+            if (buffer.len - hdr_len < byte_len) return error.IncompleteFrame;
+            const frame_end = hdr_len + byte_len;
             return .{
-                .payload = buffer[hdr_len .. hdr_len + byte_len],
-                .bytes_consumed = hdr_len + byte_len,
+                .payload = buffer[hdr_len..frame_end],
+                .bytes_consumed = frame_end,
             };
         },
         .intermediate, .padded_intermediate => {
@@ -139,15 +144,16 @@ pub fn decodeFrame(
             const byte_len: usize = std.mem.readInt(u32, buffer[0..4], .little);
             if (byte_len > max_frame_bytes) return error.PayloadTooLarge;
             if (byte_len % 4 != 0 and mode == .intermediate) return error.UnalignedPayload;
-            if (buffer.len < 4 + byte_len) return error.IncompleteFrame;
-            const raw = buffer[4 .. 4 + byte_len];
+            if (buffer.len - 4 < byte_len) return error.IncompleteFrame;
+            const frame_end = 4 + byte_len;
+            const raw = buffer[4..frame_end];
             const payload_len = if (mode == .padded_intermediate)
                 mtprotoPacketLen(raw) orelse byte_len - (byte_len % 4)
             else
                 byte_len;
             return .{
                 .payload = raw[0..payload_len],
-                .bytes_consumed = 4 + byte_len,
+                .bytes_consumed = frame_end,
             };
         },
     }
@@ -163,6 +169,10 @@ pub const CtrStream = struct {
 
     pub fn init(key: [32]u8, iv: [16]u8) CtrStream {
         return .{ .ctx = Aes256.initEnc(key), .counter = iv };
+    }
+
+    pub fn deinit(self: *CtrStream) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
     }
 
     fn nextBlock(self: *CtrStream) void {
@@ -205,6 +215,7 @@ pub const Obfuscated2 = struct {
     /// bytes `56..64` in-place.
     pub fn initClient(io: std.Io, mode: FramingMode) std.Io.RandomSecureError!Obfuscated2 {
         var hdr: [64]u8 = undefined;
+        defer std.crypto.secureZero(u8, &hdr);
         while (true) {
             try io.randomSecure(&hdr);
             if (hdr[0] == 0xef) continue;
@@ -232,6 +243,7 @@ pub const Obfuscated2 = struct {
         @memcpy(hdr[56..60], &tag_bytes);
 
         var reversed: [48]u8 = undefined;
+        defer std.crypto.secureZero(u8, &reversed);
         for (0..48) |i| {
             reversed[i] = hdr[55 - i];
         }
@@ -241,12 +253,19 @@ pub const Obfuscated2 = struct {
             .tx = CtrStream.init(hdr[8..40].*, hdr[40..56].*),
             .rx = CtrStream.init(reversed[0..32].*, reversed[32..48].*),
         };
-        std.crypto.secureZero(u8, &reversed);
 
         var encrypted_hdr = hdr;
+        defer std.crypto.secureZero(u8, &encrypted_hdr);
         self.xorTxKeystream(&encrypted_hdr);
         @memcpy(self.header[56..64], encrypted_hdr[56..64]);
         return self;
+    }
+
+    /// Zeroizes header and both AES-256-CTR stream states in memory.
+    pub fn deinit(self: *Obfuscated2) void {
+        self.tx.deinit();
+        self.rx.deinit();
+        std.crypto.secureZero(u8, &self.header);
     }
 
     pub fn xorTxKeystream(self: *Obfuscated2, bytes: []u8) void {
@@ -275,9 +294,57 @@ test "Abridged and Intermediate frame encode/decode round-trip" {
     }
 }
 
-test "Obfuscated2 client header generation and CTR symmetry" {
-    const obf = try Obfuscated2.initClient(std.testing.io, .intermediate);
+test "Obfuscated2 client header generation, CTR symmetry, and deinit zeroization" {
+    var obf = try Obfuscated2.initClient(std.testing.io, .intermediate);
     try std.testing.expect(obf.header[0] != 0xef);
+    obf.deinit();
+    for (obf.header) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (obf.tx.counter) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (obf.rx.counter) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "decodeFrame masks quick-ack bit in abridged, handles padded 4-byte errors, and guards overflow" {
+    // 1. Abridged quick-ack bit (0x80) on short (1-byte) header: 0x80 | 2 = 2 words (8 bytes).
+    const quick_short = [_]u8{ 0x82, 1, 2, 3, 4, 5, 6, 7, 8 };
+    const dec_short = try decodeFrame(.abridged, &quick_short, default_max_frame_bytes);
+    try std.testing.expectEqual(@as(usize, 9), dec_short.bytes_consumed);
+    try std.testing.expectEqualSlices(u8, quick_short[1..9], dec_short.payload);
+
+    // 2. Abridged quick-ack bit on long (4-byte) header: 0xff == 0x80 | 0x7f, words = 1 (4 bytes).
+    const quick_long = [_]u8{ 0xff, 1, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd };
+    const dec_long = try decodeFrame(.abridged, &quick_long, default_max_frame_bytes);
+    try std.testing.expectEqual(@as(usize, 8), dec_long.bytes_consumed);
+    try std.testing.expectEqualSlices(u8, quick_long[4..8], dec_long.payload);
+
+    // 3. Padded-intermediate 4-byte transport error (-404) with every padding length 0..15.
+    var err_code: [4]u8 = undefined;
+    std.mem.writeInt(i32, &err_code, -404, .little);
+    var pad: usize = 0;
+    while (pad <= 15) : (pad += 1) {
+        var frame: [4 + 4 + 15]u8 = @splat(0x55);
+        std.mem.writeInt(u32, frame[0..4], @intCast(4 + pad), .little);
+        @memcpy(frame[4..8], &err_code);
+        const dec_err = try decodeFrame(.padded_intermediate, frame[0 .. 8 + pad], default_max_frame_bytes);
+        try std.testing.expectEqual(@as(usize, 8 + pad), dec_err.bytes_consumed);
+        try std.testing.expectEqualSlices(u8, &err_code, dec_err.payload);
+    }
+
+    // 4. Huge declared frame length with maxInt(usize) cap must not overflow `4 + byte_len`.
+    const huge_hdr = [_]u8{ 0xfc, 0xff, 0xff, 0xff, 0, 0, 0, 0 };
+    try std.testing.expectError(
+        error.IncompleteFrame,
+        decodeFrame(.intermediate, &huge_hdr, std.math.maxInt(usize)),
+    );
+    const huge_padded_hdr = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0 };
+    try std.testing.expectError(
+        error.IncompleteFrame,
+        decodeFrame(.padded_intermediate, &huge_padded_hdr, std.math.maxInt(usize)),
+    );
+
+    // 5. Unencrypted packet with huge message_data_length must not overflow `20 + data_len`.
+    var crafted_unenc: [24]u8 = @splat(0);
+    std.mem.writeInt(u32, crafted_unenc[16..20], std.math.maxInt(u32) - 3, .little);
+    try std.testing.expectEqual(@as(?usize, null), mtprotoPacketLen(&crafted_unenc));
 }
 
 test "padded_intermediate appends 0..15 random bytes and decodes back" {

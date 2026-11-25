@@ -532,10 +532,46 @@ fn generateClientFile(
         \\        }});
         \\    }}
         \\
-        \\    /// Builds the download URL for a `File.file_path` returned by `getFile`.
-        \\    pub fn buildFileDownloadUrl(self: *const BotClient, allocator: Allocator, file_path: []const u8) Allocator.Error![]u8 {{
+        \\    fn formatMethodUrl(
+        \\        self: *const BotClient,
+        \\        allocator: Allocator,
+        \\        stack_buf: *[512]u8,
+        \\        method_name: []const u8,
+        \\    ) Allocator.Error!struct {{ slice: []u8, heap_allocated: bool }} {{
         \\        const base = std.mem.trimEnd(u8, self.config.base_url, "/");
-        \\        const trimmed_path = std.mem.trimStart(u8, file_path, "/");
+        \\        if (std.fmt.bufPrint(stack_buf, "{{s}}/bot{{s}}/{{s}}", .{{
+        \\            base,
+        \\            self.token.expose(),
+        \\            method_name,
+        \\        }})) |s| {{
+        \\            return .{{ .slice = s, .heap_allocated = false }};
+        \\        }} else |_| {{
+        \\            const owned = try self.buildMethodUrl(allocator, method_name);
+        \\            return .{{ .slice = owned, .heap_allocated = true }};
+        \\        }}
+        \\    }}
+        \\
+        \\    fn validateDownloadFilePath(file_path: []const u8) error{{InvalidFilePath}}![]const u8 {{
+        \\        if (file_path.len == 0) return error.InvalidFilePath;
+        \\        for (file_path) |b| {{
+        \\            if (b <= 0x20 or b == 0x7f) return error.InvalidFilePath;
+        \\            if (b == '?' or b == '#' or b == '%' or b == '\\') return error.InvalidFilePath;
+        \\        }}
+        \\        const trimmed = std.mem.trimStart(u8, file_path, "/");
+        \\        if (trimmed.len == 0) return error.InvalidFilePath;
+        \\        var it = std.mem.splitScalar(u8, trimmed, '/');
+        \\        while (it.next()) |seg| {{
+        \\            if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) {{
+        \\                return error.InvalidFilePath;
+        \\            }}
+        \\        }}
+        \\        return trimmed;
+        \\    }}
+        \\
+        \\    /// Builds the download URL for a `File.file_path` returned by `getFile`.
+        \\    pub fn buildFileDownloadUrl(self: *const BotClient, allocator: Allocator, file_path: []const u8) (Allocator.Error || error{{InvalidFilePath}})![]u8 {{
+        \\        const trimmed_path = try validateDownloadFilePath(file_path);
+        \\        const base = std.mem.trimEnd(u8, self.config.base_url, "/");
         \\        return std.fmt.allocPrint(allocator, "{{s}}/file/bot{{s}}/{{s}}", .{{
         \\            base,
         \\            self.token.expose(),
@@ -551,16 +587,36 @@ fn generateClientFile(
         \\            if (std.fs.path.isAbsolute(file_path)) {{
         \\                const host_path = try ls.resolveLocalFilePath(allocator, file_path);
         \\                defer allocator.free(host_path);
+        \\
+        \\                const base_dir = ls.host_files_dir orelse ls.server_files_dir orelse return error.InvalidFilePath;
+        \\                var base_handle = std.Io.Dir.cwd().openDir(self.io, base_dir, .{{}}) catch return error.FileReadError;
+        \\                defer base_handle.close(self.io);
+        \\
+        \\                var base_real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        \\                const base_real_len = base_handle.realPath(self.io, &base_real_buf) catch return error.FileReadError;
+        \\                const base_real = base_real_buf[0..base_real_len];
+        \\
+        \\                var file_real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        \\                const file_real_len = std.Io.Dir.cwd().realPathFile(self.io, host_path, &file_real_buf) catch return error.FileReadError;
+        \\                const file_real = file_real_buf[0..file_real_len];
+        \\
+        \\                if (!LocalServerConfig.isPathStrictlyInside(file_real, base_real)) {{
+        \\                    return error.InvalidFilePath;
+        \\                }}
+        \\
         \\                return std.Io.Dir.cwd().readFileAlloc(
         \\                    self.io,
-        \\                    host_path,
+        \\                    file_real,
         \\                    allocator,
         \\                    .limited(self.config.max_response_bytes),
         \\                ) catch return error.FileReadError;
         \\            }}
         \\        }}
         \\        const url = try self.buildFileDownloadUrl(allocator, file_path);
-        \\        defer allocator.free(url);
+        \\        defer {{
+        \\            std.crypto.secureZero(u8, url);
+        \\            allocator.free(url);
+        \\        }}
         \\        var raw = try self.transport.send(allocator, .{{
         \\            .url = url,
         \\            .body = null,
@@ -588,8 +644,13 @@ fn generateClientFile(
         \\        params: Method,
         \\        err_out: ?*?ErrorDetail,
         \\    ) TelegramError!std.json.Parsed(Method.ReturnType) {{
-        \\        const url = try self.buildMethodUrl(self.allocator, Method.api_method_name);
-        \\        defer self.allocator.free(url);
+        \\        var url_buf: [512]u8 = undefined;
+        \\        const url_res = try self.formatMethodUrl(self.allocator, &url_buf, Method.api_method_name);
+        \\        defer {{
+        \\            std.crypto.secureZero(u8, url_res.slice);
+        \\            if (url_res.heap_allocated) self.allocator.free(url_res.slice);
+        \\        }}
+        \\        const url = url_res.slice;
         \\
         \\        var raw_resp: transport_mod.RawResponse = undefined;
         \\        if (json_mod.isEmptyParams(params)) {{
@@ -650,8 +711,13 @@ fn generateClientFile(
         \\        json_body: ?[]const u8,
         \\    ) TelegramError!transport_mod.RawResponse {{
         \\        if (!transport_mod.isValidMethodName(method_name)) return error.InvalidMethodName;
-        \\        const url = try self.buildMethodUrl(allocator, method_name);
-        \\        defer allocator.free(url);
+        \\        var url_buf: [512]u8 = undefined;
+        \\        const url_res = try self.formatMethodUrl(allocator, &url_buf, method_name);
+        \\        defer {{
+        \\            std.crypto.secureZero(u8, url_res.slice);
+        \\            if (url_res.heap_allocated) allocator.free(url_res.slice);
+        \\        }}
+        \\        const url = url_res.slice;
         \\        const trimmed = if (json_body) |b| std.mem.trim(u8, b, " \t\r\n") else null;
         \\        const is_empty = trimmed == null or trimmed.?.len == 0 or std.mem.eql(u8, trimmed.?, "{{}}");
         \\        return self.transport.send(allocator, .{{

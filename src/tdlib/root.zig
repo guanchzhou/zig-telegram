@@ -75,13 +75,21 @@ pub const TdjsonClient = struct {
         self.binding.td_send(self.client_id, request_json.ptr);
     }
 
+    /// Upper bound on `timeout_seconds` passed through to C `td_receive`.
+    pub const max_receive_timeout_seconds: f64 = 86_400.0;
+
     /// Receives the next incoming TDLib JSON event or response, waiting up to
     /// `timeout_seconds`. Returns `null` on timeout.
+    ///
+    /// Rejects non-finite (`NaN`, `±inf`) or negative `timeout_seconds` without
+    /// calling `td_receive`, and clamps finite values to `max_receive_timeout_seconds`.
     ///
     /// The returned slice is owned by TDLib and is valid only until the next
     /// `receive` or `execute` call on any thread; copy it to keep it.
     pub fn receive(self: *const TdjsonClient, timeout_seconds: f64) ?[]const u8 {
-        const ptr = self.binding.td_receive(timeout_seconds) orelse return null;
+        if (!std.math.isFinite(timeout_seconds) or timeout_seconds < 0.0) return null;
+        const clamped = if (timeout_seconds == 0.0) 0.0 else @min(timeout_seconds, max_receive_timeout_seconds);
+        const ptr = self.binding.td_receive(clamped) orelse return null;
         return std.mem.span(ptr);
     }
 
@@ -126,4 +134,49 @@ test "TdjsonClient mock binding round-trip" {
     try std.testing.expectEqual(@as(c_int, 7), MockC.last_sent_id);
     try std.testing.expectEqualStrings("{\"@type\":\"ok\"}", client.execute("{\"@type\":\"setLogVerbosityLevel\"}").?);
     try std.testing.expectEqualStrings("{\"@type\":\"updateAuthorizationState\"}", client.receive(0.0).?);
+}
+
+test "TdjsonClient.receive rejects non-finite or negative timeouts and clamps huge values" {
+    const SpyC = struct {
+        var calls: usize = 0;
+        var last_timeout: f64 = -1.0;
+
+        fn createId() callconv(.c) c_int {
+            return 1;
+        }
+        fn sendFn(_: c_int, _: [*:0]const u8) callconv(.c) void {}
+        fn recvFn(t: f64) callconv(.c) ?[*:0]const u8 {
+            calls += 1;
+            last_timeout = t;
+            return "{\"@type\":\"ok\"}";
+        }
+        fn execFn(_: [*:0]const u8) callconv(.c) ?[*:0]const u8 {
+            return null;
+        }
+    };
+
+    var client = TdjsonClient.initWithBinding(.{
+        .td_create_client_id = SpyC.createId,
+        .td_send = SpyC.sendFn,
+        .td_receive = SpyC.recvFn,
+        .td_execute = SpyC.execFn,
+    });
+    defer client.deinit();
+
+    SpyC.calls = 0;
+    try std.testing.expectEqual(@as(?[]const u8, null), client.receive(std.math.nan(f64)));
+    try std.testing.expectEqual(@as(?[]const u8, null), client.receive(std.math.inf(f64)));
+    try std.testing.expectEqual(@as(?[]const u8, null), client.receive(-std.math.inf(f64)));
+    try std.testing.expectEqual(@as(?[]const u8, null), client.receive(-0.001));
+    try std.testing.expectEqual(@as(usize, 0), SpyC.calls);
+
+    // -0.0 normalizes to +0.0 and invokes td_receive.
+    try std.testing.expect(client.receive(-0.0) != null);
+    try std.testing.expectEqual(@as(usize, 1), SpyC.calls);
+    try std.testing.expect(!std.math.signbit(SpyC.last_timeout));
+
+    // Huge finite timeouts clamp to max_receive_timeout_seconds.
+    try std.testing.expect(client.receive(1e300) != null);
+    try std.testing.expectEqual(@as(usize, 2), SpyC.calls);
+    try std.testing.expectEqual(TdjsonClient.max_receive_timeout_seconds, SpyC.last_timeout);
 }

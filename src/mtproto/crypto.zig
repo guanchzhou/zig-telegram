@@ -41,24 +41,25 @@ pub fn aes256IgeEncrypt(
         return error.UnalignedBlockLength;
     }
 
-    const ctx = Aes256.initEnc(key);
-    var prev_c: [16]u8 = iv[0..16].*;
-    var prev_p: [16]u8 = iv[16..32].*;
+    var ctx = Aes256.initEnc(key);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&ctx));
+    var prev_c: @Vector(16, u8) = iv[0..16].*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prev_c));
+    var prev_p: @Vector(16, u8) = iv[16..32].*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prev_p));
+    var xored: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &xored);
+    var enc_block: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &enc_block);
 
     var offset: usize = 0;
     while (offset < plaintext.len) : (offset += 16) {
-        const p_block: [16]u8 = plaintext[offset..][0..16].*;
-        var xored: [16]u8 = undefined;
-        for (0..16) |i| {
-            xored[i] = p_block[i] ^ prev_c[i];
-        }
-        var enc_block: [16]u8 = undefined;
+        const p_block: @Vector(16, u8) = plaintext[offset..][0..16].*;
+        xored = p_block ^ prev_c;
         ctx.encrypt(&enc_block, &xored);
-        for (0..16) |i| {
-            enc_block[i] ^= prev_p[i];
-        }
-        @memcpy(ciphertext[offset..][0..16], &enc_block);
-        prev_c = enc_block;
+        const c_vec: @Vector(16, u8) = @as(@Vector(16, u8), enc_block) ^ prev_p;
+        ciphertext[offset..][0..16].* = c_vec;
+        prev_c = c_vec;
         prev_p = p_block;
     }
 }
@@ -80,32 +81,37 @@ pub fn aes256IgeDecrypt(
         return error.UnalignedBlockLength;
     }
 
-    const ctx = Aes256.initDec(key);
-    var prev_c: [16]u8 = iv[0..16].*;
-    var prev_p: [16]u8 = iv[16..32].*;
+    var ctx = Aes256.initDec(key);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&ctx));
+    var prev_c: @Vector(16, u8) = iv[0..16].*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prev_c));
+    var prev_p: @Vector(16, u8) = iv[16..32].*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prev_p));
+    var xored: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &xored);
+    var dec_block: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &dec_block);
 
     var offset: usize = 0;
     while (offset < ciphertext.len) : (offset += 16) {
-        const c_block: [16]u8 = ciphertext[offset..][0..16].*;
-        var xored: [16]u8 = undefined;
-        for (0..16) |i| {
-            xored[i] = c_block[i] ^ prev_p[i];
-        }
-        var dec_block: [16]u8 = undefined;
+        const c_block: @Vector(16, u8) = ciphertext[offset..][0..16].*;
+        xored = c_block ^ prev_p;
         ctx.decrypt(&dec_block, &xored);
-        for (0..16) |i| {
-            dec_block[i] ^= prev_c[i];
-        }
-        @memcpy(plaintext[offset..][0..16], &dec_block);
+        const p_vec: @Vector(16, u8) = @as(@Vector(16, u8), dec_block) ^ prev_c;
+        plaintext[offset..][0..16].* = p_vec;
         prev_c = c_block;
-        prev_p = dec_block;
+        prev_p = p_vec;
     }
 }
 
 /// Computes the 64-bit `auth_key_id` (lower 8 bytes of `SHA1(auth_key)` in little-endian).
 pub fn computeAuthKeyId(auth_key: *const [256]u8) u64 {
+    var hasher = Sha1.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&hasher));
+    hasher.update(auth_key);
     var sha1_digest: [20]u8 = undefined;
-    Sha1.hash(auth_key, &sha1_digest, .{});
+    defer std.crypto.secureZero(u8, &sha1_digest);
+    hasher.final(&sha1_digest);
     return std.mem.readInt(u64, sha1_digest[12..20], .little);
 }
 
@@ -119,9 +125,11 @@ pub fn computeMsgKey(
 ) [16]u8 {
     const x = @backingInt(direction);
     var hasher = Sha256.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&hasher));
     hasher.update(auth_key[88 + x .. 120 + x]);
     hasher.update(padded_plaintext);
-    const digest = hasher.finalResult();
+    var digest = hasher.finalResult();
+    defer std.crypto.secureZero(u8, &digest);
     return digest[8..24].*;
 }
 
@@ -144,14 +152,18 @@ pub fn deriveAesKeyIv(
     const x = @backingInt(direction);
 
     var h_a = Sha256.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&h_a));
     h_a.update(&msg_key);
     h_a.update(auth_key[x .. 36 + x]);
-    const sha256_a = h_a.finalResult();
+    var sha256_a = h_a.finalResult();
+    defer std.crypto.secureZero(u8, &sha256_a);
 
     var h_b = Sha256.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&h_b));
     h_b.update(auth_key[40 + x .. 76 + x]);
     h_b.update(&msg_key);
-    const sha256_b = h_b.finalResult();
+    var sha256_b = h_b.finalResult();
+    defer std.crypto.secureZero(u8, &sha256_b);
 
     var out: AesKeyIv = undefined;
     @memcpy(out.key[0..8], sha256_a[0..8]);
@@ -193,7 +205,7 @@ pub fn factorizePq(pq: u64) CryptoError!struct { p: u32, q: u32 } {
     if (isPrime(pq)) return error.FactorizationFailed;
     if (pq % 2 == 0) {
         const other = pq / 2;
-        if (other > std.math.maxInt(u32)) return error.FactorizationFailed;
+        if (other > std.math.maxInt(u32) or !isPrime(other)) return error.FactorizationFailed;
         return .{ .p = 2, .q = @intCast(other) };
     }
 
@@ -245,7 +257,9 @@ pub fn factorizePq(pq: u64) CryptoError!struct { p: u32, q: u32 } {
             const other = pq / g;
             const p_val = @min(g, other);
             const q_val = @max(g, other);
-            if (p_val <= std.math.maxInt(u32) and q_val <= std.math.maxInt(u32)) {
+            if (p_val <= std.math.maxInt(u32) and q_val <= std.math.maxInt(u32) and
+                isPrime(p_val) and isPrime(q_val))
+            {
                 return .{ .p = @intCast(p_val), .q = @intCast(q_val) };
             }
             return error.FactorizationFailed;
@@ -355,10 +369,21 @@ test "factorizePq rejects pq >= 2^63 and factors of 2^32 or more" {
     try std.testing.expectError(error.FactorizationFailed, factorizePq(2 * (1 << 40)));
 }
 
-test "factorizePq factors a small semiprime" {
+test "factorizePq factors a small semiprime and rejects non-semiprime composites" {
     const res = try factorizePq(999983 * 1000003);
     try std.testing.expectEqual(@as(u32, 999983), res.p);
     try std.testing.expectEqual(@as(u32, 1000003), res.q);
+
+    const even_semi = try factorizePq(2 * 1000003);
+    try std.testing.expectEqual(@as(u32, 2), even_semi.p);
+    try std.testing.expectEqual(@as(u32, 1000003), even_semi.q);
+
+    // Composite numbers with >2 prime factors must be rejected.
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(12)); // 2 * 2 * 3
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(30)); // 2 * 3 * 5
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(105)); // 3 * 5 * 7
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(27)); // 3 * 3 * 3
+    try std.testing.expectError(error.FactorizationFailed, factorizePq(3 * 5 * 999983));
 }
 
 test "isPrime on small and composite inputs" {

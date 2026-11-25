@@ -260,6 +260,9 @@ pub fn parseMaybeInaccessibleMessage(
     }
 }
 
+/// Maximum nesting depth permitted when capturing a JSON value from a streaming source.
+pub const max_capture_depth: usize = 64;
+
 /// Captures a balanced JSON value (object, array, string, number, bool, null)
 /// from `source` as a valid JSON slice.
 ///
@@ -286,7 +289,7 @@ pub fn captureRawJsonValue(
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     var jw: std.json.Stringify = .{ .writer = &out.writer };
-    try copyNextJsonValue(allocator, source, &jw);
+    try copyNextJsonValue(allocator, source, &jw, 0);
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
@@ -329,10 +332,13 @@ fn copyNextJsonValue(
     allocator: Allocator,
     source: anytype,
     jw: *std.json.Stringify,
+    depth: usize,
 ) std.json.ParseError(@TypeOf(source.*))!void {
+    if (depth > max_capture_depth) return error.SyntaxError;
     const tok = try source.nextAlloc(allocator, .alloc_if_needed);
     switch (tok) {
         .object_begin => {
+            if (depth >= max_capture_depth) return error.SyntaxError;
             jw.beginObject() catch return error.OutOfMemory;
             while (true) {
                 if (try source.peekNextTokenType() == .object_end) {
@@ -345,18 +351,19 @@ fn copyNextJsonValue(
                     else => return error.UnexpectedToken,
                 };
                 jw.objectField(key_str) catch return error.OutOfMemory;
-                try copyNextJsonValue(allocator, source, jw);
+                try copyNextJsonValue(allocator, source, jw, depth + 1);
             }
             jw.endObject() catch return error.OutOfMemory;
         },
         .array_begin => {
+            if (depth >= max_capture_depth) return error.SyntaxError;
             jw.beginArray() catch return error.OutOfMemory;
             while (true) {
                 if (try source.peekNextTokenType() == .array_end) {
                     _ = try source.next();
                     break;
                 }
-                try copyNextJsonValue(allocator, source, jw);
+                try copyNextJsonValue(allocator, source, jw, depth + 1);
             }
             jw.endArray() catch return error.OutOfMemory;
         },
@@ -454,9 +461,15 @@ fn fastExtractTopLevelUnescapedString(raw: []const u8, field_name: []const u8) ?
             '"' => {
                 const str_start = i + 1;
                 var j = str_start;
+                var has_escape = false;
                 while (j < raw.len) : (j += 1) {
-                    if (raw[j] == '\\') return null;
-                    if (raw[j] == '"') break;
+                    if (raw[j] == '\\') {
+                        has_escape = true;
+                        j += 1;
+                        if (j >= raw.len) return null;
+                    } else if (raw[j] == '"') {
+                        break;
+                    }
                 }
                 if (j >= raw.len) return null;
                 const s = raw[str_start..j];
@@ -464,6 +477,7 @@ fn fastExtractTopLevelUnescapedString(raw: []const u8, field_name: []const u8) ?
 
                 if (depth == 1 and expecting_key) {
                     expecting_key = false;
+                    if (has_escape) return null;
                     if (std.mem.eql(u8, s, field_name)) {
                         while (i < raw.len and (raw[i] == ' ' or raw[i] == '\t' or raw[i] == '\r' or raw[i] == '\n')) : (i += 1) {}
                         if (i >= raw.len or raw[i] != ':') return null;
@@ -650,4 +664,38 @@ test "parseResponseEnvelope captures retry_after and migrate_to_chat_id" {
     try std.testing.expectEqual(@as(?u32, 23), detail.?.retry_after);
     try std.testing.expectEqual(@as(?i64, -100555666777), detail.?.migrate_to_chat_id);
     try std.testing.expectEqualStrings("Too Many Requests: retry after 23", detail.?.description);
+}
+
+test "copyNextJsonValue enforces max_capture_depth on streaming Reader" {
+    const allocator = std.testing.allocator;
+    const depth = max_capture_depth + 2;
+    var deep = try allocator.alloc(u8, depth * 2);
+    defer allocator.free(deep);
+    @memset(deep[0..depth], '[');
+    @memset(deep[depth..], ']');
+
+    var fixed = std.Io.Reader.fixed(deep);
+    var json_reader = std.json.Reader.init(allocator, &fixed);
+    defer json_reader.deinit();
+
+    try std.testing.expectError(error.SyntaxError, captureRawJsonValue(allocator, &json_reader));
+}
+
+test "fastExtractTopLevelUnescapedString skips escapes in non-matching strings" {
+    const raw =
+        \\{"caption":"line1\n\"quoted\"\\end","nested":{"k":"v\"x"},"type":"photo"}
+    ;
+    // Fast path must succeed directly without bailing out on earlier escaped strings.
+    const direct = fastExtractTopLevelUnescapedString(raw, "type");
+    try std.testing.expect(direct != null);
+    try std.testing.expectEqualStrings("photo", direct.?);
+
+    // If the matching value itself contains an escape, fast path returns null and scanner handles it.
+    const escaped_val =
+        \\{"type":"ph\u006fto"}
+    ;
+    try std.testing.expectEqual(@as(?[]const u8, null), fastExtractTopLevelUnescapedString(escaped_val, "type"));
+    const extracted = try extractTopLevelStringField(std.testing.allocator, escaped_val, "type");
+    defer if (extracted) |s| std.testing.allocator.free(s);
+    try std.testing.expectEqualStrings("photo", extracted.?);
 }

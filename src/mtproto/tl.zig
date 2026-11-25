@@ -27,6 +27,7 @@ pub const TlError = error{
     UnexpectedEof,
     UnalignedPadding,
     NonZeroPadding,
+    NonCanonicalLength,
     InvalidBoolConstructor,
     InvalidVectorConstructor,
     StringTooLarge,
@@ -221,6 +222,7 @@ pub const TlReader = struct {
             len = @as(usize, self.buf[self.pos + 1]) |
                 (@as(usize, self.buf[self.pos + 2]) << 8) |
                 (@as(usize, self.buf[self.pos + 3]) << 16);
+            if (len < 254) return error.NonCanonicalLength;
             header_len = 4;
         } else {
             return error.StringTooLarge;
@@ -300,4 +302,32 @@ test "readVectorLen rejects counts larger than the remaining input" {
     try hdr.beginVector(std.math.maxInt(u32));
     var huge = TlReader.init(hdr.written());
     try std.testing.expectError(error.VectorTooLarge, huge.readVectorLen(4));
+}
+
+test "TlReader.readBytes rejects non-canonical long string encoding (len < 254)" {
+    // first == 254 with len == 0
+    const zero_long = [_]u8{ 0xfe, 0, 0, 0 };
+    var r0 = TlReader.init(&zero_long);
+    try std.testing.expectError(error.NonCanonicalLength, r0.readBytes());
+
+    // first == 254 with len == 5
+    const short_long = [_]u8{ 0xfe, 5, 0, 0, 'h', 'e', 'l', 'l', 'o', 0, 0, 0 };
+    var r5 = TlReader.init(&short_long);
+    try std.testing.expectError(error.NonCanonicalLength, r5.readBytes());
+
+    // first == 254 with len == 253 (boundary case just below 254)
+    var buf253: [4 + 256]u8 = @splat(0);
+    buf253[0] = 0xfe;
+    buf253[1] = 253;
+    var r253 = TlReader.init(&buf253);
+    try std.testing.expectError(error.NonCanonicalLength, r253.readBytes());
+
+    // first == 254 with len == 254 is valid canonical long encoding
+    var buf254: [4 + 256]u8 = @splat(0);
+    buf254[0] = 0xfe;
+    buf254[1] = 254;
+    @memset(buf254[4 .. 4 + 254], 'x');
+    var r254 = TlReader.init(&buf254);
+    const decoded = try r254.readBytes();
+    try std.testing.expectEqual(@as(usize, 254), decoded.len);
 }

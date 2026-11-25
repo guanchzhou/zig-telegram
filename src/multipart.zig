@@ -98,7 +98,7 @@ pub fn hasRuntimeAttachment(value: anytype) bool {
 /// Generates a 128-bit CSPRNG multipart boundary string (`"----ZigTelegramBoundary<32-hex>"`).
 pub fn generateBoundary(io: std.Io) [55]u8 {
     var entropy: [16]u8 = undefined;
-    io.random(&entropy);
+    io.randomSecure(&entropy) catch io.random(&entropy);
     const hex = std.fmt.bytesToHex(entropy, .lower);
     var out: [55]u8 = undefined;
     const prefix = "----ZigTelegramBoundary";
@@ -107,12 +107,25 @@ pub fn generateBoundary(io: std.Io) [55]u8 {
     return out;
 }
 
+/// Validates a multipart boundary against RFC 2046 `bcharsnospace` (1..70 bytes).
+pub fn isValidBoundary(boundary: []const u8) bool {
+    if (boundary.len == 0 or boundary.len > 70) return false;
+    for (boundary) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        switch (c) {
+            '\'', '(', ')', '+', '_', ',', '-', '.', '/', ':', '=', '?' => continue,
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Validates that a multipart field or filename contains no ASCII control
-/// characters (`\r`, `\n`, `\0`) and writes it with `"` and `\` escaped per
+/// characters (`< 0x20` or `0x7f`) and writes it with `"` and `\` escaped per
 /// RFC 7578.
 pub fn writeEscapedHeaderParam(writer: *std.Io.Writer, value: []const u8) (error{InvalidMultipartHeader} || std.Io.Writer.Error)!void {
     for (value) |b| {
-        if (b == '\r' or b == '\n' or b == 0) return error.InvalidMultipartHeader;
+        if (b < 0x20 or b == 0x7f) return error.InvalidMultipartHeader;
     }
     for (value) |b| {
         if (b == '"' or b == '\\') {
@@ -120,6 +133,16 @@ pub fn writeEscapedHeaderParam(writer: *std.Io.Writer, value: []const u8) (error
         }
         try writer.writeByte(b);
     }
+}
+
+/// Validates a `Content-Type` header value (non-empty, no ASCII CTLs, quotes,
+/// backslashes, or CR/LF) and writes it verbatim.
+pub fn writeValidatedContentType(writer: *std.Io.Writer, content_type: []const u8) (error{InvalidMultipartHeader} || std.Io.Writer.Error)!void {
+    if (content_type.len == 0) return error.InvalidMultipartHeader;
+    for (content_type) |b| {
+        if (b < 0x20 or b == 0x7f or b == '"' or b == '\\') return error.InvalidMultipartHeader;
+    }
+    try writer.writeAll(content_type);
 }
 
 /// Pending binary file attachment collected while serializing a method struct.
@@ -160,6 +183,7 @@ pub fn encodeMultipart(
     const T = @TypeOf(params);
     const info = @typeInfo(T);
     if (info != .@"struct") return error.BadRequest;
+    if (!isValidBoundary(boundary)) return error.InvalidMultipartHeader;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -173,10 +197,10 @@ pub fn encodeMultipart(
         const raw_val = @field(params, fname);
         if (@typeInfo(ftype) == .optional) {
             if (raw_val) |unwrapped| {
-                try encodeTopLevelField(arena, io, &out.writer, boundary, fname, unwrapped, &pending_parts);
+                try encodeTopLevelField(allocator, arena, io, &out.writer, boundary, fname, unwrapped, &pending_parts);
             }
         } else {
-            try encodeTopLevelField(arena, io, &out.writer, boundary, fname, raw_val, &pending_parts);
+            try encodeTopLevelField(allocator, arena, io, &out.writer, boundary, fname, raw_val, &pending_parts);
         }
     }
 
@@ -199,6 +223,7 @@ pub fn encodeMultipart(
 }
 
 fn encodeTopLevelField(
+    allocator: Allocator,
     arena: Allocator,
     io: std.Io,
     writer: *std.Io.Writer,
@@ -214,7 +239,7 @@ fn encodeTopLevelField(
                 try writeTextPart(writer, boundary, field_name, str);
             },
             .path, .bytes => {
-                try writeBinaryFilePart(arena, io, writer, boundary, field_name, val);
+                try writeBinaryFilePart(allocator, io, writer, boundary, field_name, val);
             },
         }
         return;
@@ -239,13 +264,18 @@ fn encodeTopLevelField(
 
     switch (@typeInfo(V)) {
         .int, .comptime_int => {
-            var num_buf: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{val}) catch unreachable;
+            const s = try std.fmt.allocPrint(arena, "{d}", .{val});
             try writeTextPart(writer, boundary, field_name, s);
         },
-        .float, .comptime_float => {
-            var num_buf: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&num_buf, "{d}", .{val}) catch unreachable;
+        .float => {
+            if (!std.math.isFinite(val)) return error.BadRequest;
+            const s = try std.fmt.allocPrint(arena, "{d}", .{val});
+            try writeTextPart(writer, boundary, field_name, s);
+        },
+        .comptime_float => {
+            const f: f64 = val;
+            if (!std.math.isFinite(f)) return error.BadRequest;
+            const s = try std.fmt.allocPrint(arena, "{d}", .{f});
             try writeTextPart(writer, boundary, field_name, s);
         },
         .bool => {
@@ -404,7 +434,7 @@ fn writeBinaryFilePart(
                 error.WriteFailed => error.OutOfMemory,
             };
             writer.writeAll("\"\r\nContent-Type: ") catch return error.OutOfMemory;
-            writeEscapedHeaderParam(writer, b.content_type) catch |err| return switch (err) {
+            writeValidatedContentType(writer, b.content_type) catch |err| return switch (err) {
                 error.InvalidMultipartHeader => error.InvalidMultipartHeader,
                 error.WriteFailed => error.OutOfMemory,
             };
@@ -495,7 +525,7 @@ test "recursive containsAttachment and nested attach:// multipart encoding" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.body, "\x89PNG\r\n\x1a\n") != null);
 }
 
-test "writeEscapedHeaderParam rejects CRLF injection" {
+test "writeEscapedHeaderParam rejects CRLF and all ASCII control characters" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
 
@@ -503,4 +533,68 @@ test "writeEscapedHeaderParam rejects CRLF injection" {
         error.InvalidMultipartHeader,
         writeEscapedHeaderParam(&out.writer, "evil\"\r\nX-Injected: 1"),
     );
+    var ctl: u8 = 0;
+    while (ctl < 0x20) : (ctl += 1) {
+        const s = [_]u8{ 'a', ctl, 'b' };
+        try std.testing.expectError(error.InvalidMultipartHeader, writeEscapedHeaderParam(&out.writer, &s));
+    }
+    try std.testing.expectError(error.InvalidMultipartHeader, writeEscapedHeaderParam(&out.writer, "a\x7fb"));
+}
+
+test "encodeMultipart validates boundary, content_type, floats, and frees top-level file scratch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // 1. Boundary validation (1..70 bytes, RFC 2046 bcharsnospace).
+    const valid_boundary = generateBoundary(io);
+    try std.testing.expect(isValidBoundary(&valid_boundary));
+    try std.testing.expect(!isValidBoundary(""));
+    const too_long: [71]u8 = @splat('a');
+    try std.testing.expect(!isValidBoundary(&too_long));
+    try std.testing.expect(!isValidBoundary("bad boundary"));
+    try std.testing.expect(!isValidBoundary("bad;boundary"));
+    try std.testing.expect(!isValidBoundary("bad\r\nboundary"));
+
+    const Simple = struct { name: []const u8 };
+    try std.testing.expectError(
+        error.InvalidMultipartHeader,
+        encodeMultipart(allocator, io, "bad;boundary", Simple{ .name = "x" }),
+    );
+
+    // 2. Strict content_type validation (reject CTLs, quotes, backslashes, empty).
+    const WithBytes = struct { file: InputFile };
+    for ([_][]const u8{ "", "image/png\r\nX-Evil: 1", "image/png\t", "image/\"png", "image\\png", "image/\x7fpng" }) |bad_ct| {
+        try std.testing.expectError(
+            error.InvalidMultipartHeader,
+            encodeMultipart(allocator, io, &valid_boundary, WithBytes{
+                .file = .{ .bytes = .{ .filename = "a.bin", .data = "ok", .content_type = bad_ct } },
+            }),
+        );
+    }
+
+    // 3. Large / subnormal f64 must format without panicking; non-finite floats must be rejected.
+    const FloatParams = struct { lat: f64 };
+    for ([_]f64{ std.math.floatMax(f64), -std.math.floatMax(f64), std.math.floatTrueMin(f64) }) |v| {
+        var encoded = try encodeMultipart(allocator, io, &valid_boundary, FloatParams{ .lat = v });
+        defer encoded.deinit(allocator);
+        try std.testing.expect(encoded.body.len > 64);
+    }
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |bad_f| {
+        try std.testing.expectError(
+            error.BadRequest,
+            encodeMultipart(allocator, io, &valid_boundary, FloatParams{ .lat = bad_f }),
+        );
+    }
+
+    // 4. Top-level `.path` file upload reads using `allocator` (not arena) and frees scratch cleanly.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "sample.bin", .data = "TOP_LEVEL_FILE_BYTES" });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_len = try tmp.dir.realPathFile(io, "sample.bin", &path_buf);
+    var encoded_file = try encodeMultipart(allocator, io, &valid_boundary, WithBytes{
+        .file = .{ .path = path_buf[0..real_len] },
+    });
+    defer encoded_file.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_file.body, "TOP_LEVEL_FILE_BYTES") != null);
 }

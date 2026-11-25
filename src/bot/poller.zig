@@ -24,6 +24,8 @@ pub const PollerConfig = struct {
     initial_backoff_ms: u64 = 500,
     /// Maximum backoff in milliseconds.
     max_backoff_ms: u64 = 30_000,
+    /// Maximum `retry_after` sleep duration in seconds honored on HTTP 429.
+    max_retry_after_seconds: u32 = 300,
 };
 
 pub const Poller = struct {
@@ -62,7 +64,7 @@ pub const Poller = struct {
         }, err_out);
 
         for (parsed.value) |upd| {
-            const candidate = upd.update_id + 1;
+            const candidate = upd.update_id +| 1;
             if (self.next_offset == null or candidate > self.next_offset.?) {
                 self.next_offset = candidate;
             }
@@ -92,11 +94,20 @@ pub const Poller = struct {
         return half + rand % (delay_ms - half + 1);
     }
 
+    /// Clamps a server-provided `retry_after` value (in seconds) against
+    /// `config.max_retry_after_seconds` and returns milliseconds to sleep.
+    pub fn clampRetryAfterMs(self: *const Poller, retry_after: ?u32) u64 {
+        const raw_secs: u32 = retry_after orelse 1;
+        const clamped_secs: u64 = @min(raw_secs, self.config.max_retry_after_seconds);
+        return clamped_secs * 1000;
+    }
+
     /// Runs the polling loop until `stop()` is called or `max_batches` is
     /// reached (when non-null).
     ///
     /// On `error.TooManyRequests` (HTTP 429), automatically sleeps for the
-    /// server-provided `ErrorDetail.retry_after` seconds.
+    /// server-provided `ErrorDetail.retry_after` seconds (clamped to
+    /// `config.max_retry_after_seconds`).
     pub fn run(
         self: *Poller,
         ctx: anytype,
@@ -116,8 +127,8 @@ pub const Poller = struct {
             var batch = self.pollBatch(&detail) catch |err| switch (err) {
                 error.Unauthorized, error.Conflict => return err,
                 error.TooManyRequests => {
-                    const retry_secs: u64 = if (detail) |d| (d.retry_after orelse 1) else 1;
-                    self.sleepMs(retry_secs * 1000);
+                    const retry_after = if (detail) |d| d.retry_after else null;
+                    self.sleepMs(self.clampRetryAfterMs(retry_after));
                     continue;
                 },
                 else => {
@@ -199,4 +210,46 @@ test "applyJitter stays within half to full delay" {
     }
     try std.testing.expectEqual(@as(u64, 500), Poller.applyJitter(1000, 0));
     try std.testing.expectEqual(@as(u64, 1000), Poller.applyJitter(1000, 500));
+}
+
+test "Poller saturates maxInt(i64) update_id and clamps retry_after" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const transport_mod = @import("../transport.zig");
+    const secret_mod = @import("../secret.zig");
+
+    var mock = transport_mod.MockTransport.init(allocator);
+    defer mock.deinit();
+
+    try mock.pushResponse(200,
+        \\{"ok":true,"result":[{"update_id":9223372036854775807}]}
+    );
+    try mock.pushResponse(429,
+        \\{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":999999}}
+    );
+    try mock.pushResponse(200,
+        \\{"ok":true,"result":[]}
+    );
+
+    const token = try secret_mod.SecretToken.initValidated("123456:AAH_valid_token");
+    const bot = BotClient.init(allocator, io, token, mock.transport(), .{});
+
+    // Default max_retry_after_seconds clamps 999999 -> 300s (300_000 ms).
+    const default_poller = Poller.init(&bot, .{});
+    try std.testing.expectEqual(@as(u64, 300_000), default_poller.clampRetryAfterMs(999_999));
+    try std.testing.expectEqual(@as(u64, 15_000), default_poller.clampRetryAfterMs(15));
+    try std.testing.expectEqual(@as(u64, 1_000), default_poller.clampRetryAfterMs(null));
+
+    // Custom cap 0 allows testing huge retry_after without sleeping; update_id == maxInt(i64) saturates.
+    var poller = Poller.init(&bot, .{ .initial_backoff_ms = 0, .max_retry_after_seconds = 0 });
+    const Sink = struct {
+        seen: usize = 0,
+        fn onUpdate(self: *@This(), _: Update) !void {
+            self.seen += 1;
+        }
+    };
+    var sink = Sink{};
+    try poller.run(&sink, Sink.onUpdate, 3);
+    try std.testing.expectEqual(@as(usize, 1), sink.seen);
+    try std.testing.expectEqual(@as(?i64, std.math.maxInt(i64)), poller.next_offset);
 }

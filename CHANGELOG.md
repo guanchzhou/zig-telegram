@@ -2,6 +2,51 @@
 
 All notable changes to `zig-telegram` are documented in this file.
 
+## [0.1.2] - 2026-11-25
+
+### Security
+
+- `downloadFile` validates remote file paths against traversal components,
+  leading slashes, and control characters before building request URLs.
+- `LocalServerConfig` enforces strict directory confinement, rejects root or
+  unconfined base paths, and verifies canonical symlink targets stay inside the
+  configured files directory.
+- `HttpTransport` disables automatic HTTP redirects (`redirect_behavior =
+  .not_allowed`) so bot tokens in request URLs are never forwarded across
+  origins.
+- Multipart encoding validates boundaries, `Content-Type` values, and header
+  fields against control characters and CRLF injection.
+- MTProto hardening: `Session` enforces a replay-window watermark to reject
+  messages older than the sliding window, `factorizePq` verifies primality of
+  both returned factors, `secureZero` scrubs sensitive buffers before release,
+  and `TlReader` rejects non-canonical TL string/bytes length encodings.
+- Webhook verification rejects duplicate secret-token headers, enforces a JSON
+  nesting depth limit, and rejects unexpected attachments.
+- CLI rejects malformed `--api-url` values (userinfo, query, fragment, or
+  non-loopback HTTP) and escapes JSON output via `std.json.Stringify`.
+
+### Fixed
+
+- MTProto framing fixes frame-length integer overflow checks, quick-ack frame
+  decoding, and 4-byte transport error-frame handling.
+- JSON serialization rejects non-finite floating-point values (`NaN`, `Inf`).
+- `Poller` guards `offset` advancement against `i64` overflow and caps
+  `retry_after` backoff delays.
+- CLI validates `--timeout` (0..3600) and `--limit` (1..100) flags for `poll`
+  instead of silently accepting out-of-range values.
+- TDLib clamps receive timeout values to a safe bounded range before passing
+  them across the C ABI.
+
+### Performance
+
+- Vectorized AES-256-IGE block XOR using Zig SIMD vectors.
+- Fixed multipart `.path` streaming to reuse the scratch allocator instead of
+  allocating per-part buffers unnecessarily.
+- Added a fast-path scan to skip JSON string escaping when no characters
+  require escaping.
+- Used a stack-allocated URL buffer for Bot API method requests to avoid
+  per-call heap allocations.
+
 ## [0.1.1] - 2026-10-25
 
 ### Security

@@ -111,6 +111,15 @@ test "CLI rejects non-https --api-url unless the host is loopback" {
     try std.testing.expect(!cli.isAllowedApiUrl("http://127.0.0.1.evil.example"));
     try std.testing.expect(!cli.isAllowedApiUrl("ftp://127.0.0.1"));
     try std.testing.expect(!cli.isAllowedApiUrl("not a url"));
+    // Missing host, userinfo, query, and fragment must all be rejected.
+    try std.testing.expect(!cli.isAllowedApiUrl("https://"));
+    try std.testing.expect(!cli.isAllowedApiUrl("https://user@api.telegram.org"));
+    try std.testing.expect(!cli.isAllowedApiUrl("https://user:pass@api.telegram.org"));
+    try std.testing.expect(!cli.isAllowedApiUrl("https://api.telegram.org?x=1"));
+    try std.testing.expect(!cli.isAllowedApiUrl("https://api.telegram.org#frag"));
+    try std.testing.expect(!cli.isAllowedApiUrl("http://user@127.0.0.1:8081"));
+    try std.testing.expect(!cli.isAllowedApiUrl("http://127.0.0.1:8081?x=1"));
+    try std.testing.expect(!cli.isAllowedApiUrl("http://127.0.0.1:8081#frag"));
 
     const allocator = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -122,6 +131,78 @@ test "CLI rejects non-https --api-url unless the host is loopback" {
     const code = try cli.runCli(allocator, std.testing.io, &.{ "me", "--token", "123:abc", "--api-url", "http://example.com" }, null, mock.transport(), &out.writer, &err_out.writer);
     try std.testing.expectEqual(@as(u8, 2), code);
     try std.testing.expect(mock.recorded.items.len == 0);
+}
+
+test "CLI poll returns exit code 2 on invalid or out-of-range --timeout and --limit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tok = "777000:AAH_cli_poll_test";
+
+    const bad_cases = [_][]const []const u8{
+        &.{ "poll", "--timeout" },
+        &.{ "poll", "--timeout", "abc" },
+        &.{ "poll", "--timeout", "-1" },
+        &.{ "poll", "--timeout", "3601" },
+        &.{ "poll", "--limit" },
+        &.{ "poll", "--limit", "xyz" },
+        &.{ "poll", "--limit", "0" },
+        &.{ "poll", "--limit", "101" },
+    };
+
+    for (bad_cases) |argv| {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var err_out: std.Io.Writer.Allocating = .init(allocator);
+        defer err_out.deinit();
+        var mock = telegram.MockTransport.init(allocator);
+        defer mock.deinit();
+
+        const code = try cli.runCli(allocator, io, argv, tok, mock.transport(), &out.writer, &err_out.writer);
+        try std.testing.expectEqual(@as(u8, 2), code);
+        try std.testing.expectEqual(@as(usize, 0), mock.recorded.items.len);
+    }
+}
+
+test "CLI file --out emits properly JSON-escaped output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/out\"quote\\slash.bin", .{dir_buf[0..dir_len]});
+    defer allocator.free(out_path);
+
+    var mock = telegram.MockTransport.init(allocator);
+    defer mock.deinit();
+    try mock.pushResponse(200,
+        \\{"ok":true,"result":{"file_id":"fid1","file_unique_id":"uid1","file_path":"photos/p1.bin"}}
+    );
+    try mock.pushResponse(200, "HELLO");
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var err_out: std.Io.Writer.Allocating = .init(allocator);
+    defer err_out.deinit();
+
+    const code = try cli.runCli(
+        allocator,
+        io,
+        &.{ "file", "--id", "fid1", "--out", out_path },
+        "777000:AAH_cli_file_test",
+        mock.transport(),
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+
+    const Parsed = struct { saved: []const u8, bytes: usize };
+    var parsed = try std.json.parseFromSlice(Parsed, allocator, std.mem.trimEnd(u8, out.written(), "\r\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(out_path, parsed.value.saved);
+    try std.testing.expectEqual(@as(usize, 5), parsed.value.bytes);
 }
 
 test "callRawJson rejects invalid method names before sending" {

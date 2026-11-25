@@ -37,11 +37,23 @@ pub const LocalServerConfig = struct {
     /// Remaps a `File.file_path` returned by a `--local` server to the host
     /// filesystem path. Caller owns the returned slice.
     ///
-    /// Rejects paths containing NUL or a `..` component. When
-    /// `server_files_dir` is set, `file_path` must lie inside it (prefix + `/`)
-    /// and is remapped onto `host_files_dir` (or kept as is when that is null).
-    /// When only `host_files_dir` is set, `file_path` must lie inside it.
+    /// Rejects paths containing NUL or a `..` component, and rejects configs
+    /// where both `server_files_dir` and `host_files_dir` are null or where
+    /// either normalizes to `"/"`. When `server_files_dir` is set, `file_path`
+    /// must lie inside it (prefix + `/`) and is remapped onto `host_files_dir`
+    /// (or kept as is when that is null). When only `host_files_dir` is set,
+    /// `file_path` must lie inside it.
     pub fn resolveLocalFilePath(self: LocalServerConfig, allocator: Allocator, file_path: []const u8) PathError![]u8 {
+        if (self.server_files_dir == null and self.host_files_dir == null) {
+            return error.InvalidFilePath;
+        }
+        if (self.server_files_dir) |srv_dir| {
+            if (normalizesToRootOrEmpty(srv_dir)) return error.InvalidFilePath;
+        }
+        if (self.host_files_dir) |host_dir| {
+            if (normalizesToRootOrEmpty(host_dir)) return error.InvalidFilePath;
+        }
+
         if (std.mem.indexOfScalar(u8, file_path, 0) != null) return error.InvalidFilePath;
         var it = std.mem.splitAny(u8, file_path, "/\\");
         while (it.next()) |component| {
@@ -55,13 +67,39 @@ pub const LocalServerConfig = struct {
         }
         if (self.host_files_dir) |host_dir| {
             _ = pathInside(file_path, host_dir) orelse return error.InvalidFilePath;
+            return allocator.dupe(u8, file_path);
         }
-        return allocator.dupe(u8, file_path);
+        return error.InvalidFilePath;
+    }
+
+    /// Returns `true` when `path` lies strictly inside `base_dir` and `base_dir`
+    /// does not normalize to `"/"` or empty.
+    pub fn isPathStrictlyInside(path: []const u8, base_dir: []const u8) bool {
+        if (normalizesToRootOrEmpty(base_dir)) return false;
+        return pathInside(path, base_dir) != null;
+    }
+
+    /// Returns `true` if `dir` is empty, contains NUL, or normalizes to `"/"`.
+    fn normalizesToRootOrEmpty(dir: []const u8) bool {
+        if (dir.len == 0) return true;
+        if (std.mem.indexOfScalar(u8, dir, 0) != null) return true;
+        var depth: usize = 0;
+        var it = std.mem.splitAny(u8, dir, "/\\");
+        while (it.next()) |comp| {
+            if (comp.len == 0 or std.mem.eql(u8, comp, ".")) continue;
+            if (std.mem.eql(u8, comp, "..")) {
+                if (depth > 0) depth -= 1;
+            } else {
+                depth += 1;
+            }
+        }
+        return depth == 0;
     }
 
     /// Returns the `/...` remainder of `path` when it lies strictly inside `dir`.
     fn pathInside(path: []const u8, dir: []const u8) ?[]const u8 {
         const prefix = std.mem.trimEnd(u8, dir, "/");
+        if (prefix.len == 0) return null;
         if (!std.mem.startsWith(u8, path, prefix)) return null;
         const rest = path[prefix.len..];
         if (rest.len < 2 or rest[0] != '/') return null;
@@ -132,6 +170,7 @@ const BoundedWriter = struct {
     list: std.ArrayList(u8) = .empty,
     max_bytes: usize,
     exceeded: bool = false,
+    oom: bool = false,
     writer: std.Io.Writer,
 
     fn init(allocator: Allocator, max_bytes: usize, buffer: []u8) BoundedWriter {
@@ -157,6 +196,7 @@ const BoundedWriter = struct {
             return error.OutOfMemory;
         };
         if (self.exceeded) return error.ResponseTooLarge;
+        if (self.oom) return error.OutOfMemory;
         return self.list.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
     }
 
@@ -175,10 +215,12 @@ const BoundedWriter = struct {
             total += slice.len;
         }
         const pattern = data[data.len - 1];
-        var i: usize = 0;
-        while (i < splat) : (i += 1) {
-            try self.appendChecked(pattern);
-            total += pattern.len;
+        if (pattern.len > 0) {
+            var i: usize = 0;
+            while (i < splat) : (i += 1) {
+                try self.appendChecked(pattern);
+                total += pattern.len;
+            }
         }
         return total;
     }
@@ -188,7 +230,10 @@ const BoundedWriter = struct {
             self.exceeded = true;
             return error.WriteFailed;
         }
-        self.list.appendSlice(self.allocator, bytes) catch return error.WriteFailed;
+        self.list.appendSlice(self.allocator, bytes) catch {
+            self.oom = true;
+            return error.WriteFailed;
+        };
     }
 };
 
@@ -197,7 +242,7 @@ const BoundedWriter = struct {
 /// requests on stale pooled connection reset.
 pub const HttpTransport = struct {
     http_client: std.http.Client,
-    user_agent: []const u8 = "zig-telegram/0.1.1",
+    user_agent: []const u8 = "zig-telegram/0.1.2",
 
     pub fn init(allocator: Allocator, io: std.Io) HttpTransport {
         return .{
@@ -238,28 +283,37 @@ pub const HttpTransport = struct {
         return req.body == null;
     }
 
-    fn executeOnce(self: *HttpTransport, allocator: Allocator, req: RawRequest) TelegramError!RawResponse {
-        var scratch_buf: [4096]u8 = undefined;
-        var bounded = BoundedWriter.init(allocator, req.max_response_bytes, &scratch_buf);
-        defer bounded.deinit();
-
+    fn buildFetchOptions(
+        self: *const HttpTransport,
+        req: RawRequest,
+        response_writer: *std.Io.Writer,
+    ) std.http.Client.FetchOptions {
         var headers: std.http.Client.Request.Headers = .{
             .user_agent = .{ .override = self.user_agent },
         };
         if (req.content_type) |ct| {
             headers.content_type = .{ .override = ct };
         }
-
         const method: std.http.Method = if (req.body != null) .POST else .GET;
-        const fetch_res = self.http_client.fetch(.{
+        return .{
             .location = .{ .url = req.url },
             .method = method,
             .payload = req.body,
             .keep_alive = true,
+            .redirect_behavior = .not_allowed,
             .headers = headers,
-            .response_writer = &bounded.writer,
-        }) catch |err| {
+            .response_writer = response_writer,
+        };
+    }
+
+    fn executeOnce(self: *HttpTransport, allocator: Allocator, req: RawRequest) TelegramError!RawResponse {
+        var scratch_buf: [4096]u8 = undefined;
+        var bounded = BoundedWriter.init(allocator, req.max_response_bytes, &scratch_buf);
+        defer bounded.deinit();
+
+        const fetch_res = self.http_client.fetch(self.buildFetchOptions(req, &bounded.writer)) catch |err| {
             if (bounded.exceeded) return error.ResponseTooLarge;
+            if (bounded.oom) return error.OutOfMemory;
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.TransportError,
@@ -437,6 +491,65 @@ test "LocalServerConfig rejects path traversal and paths outside the files dir" 
     const inside = try host_only.resolveLocalFilePath(allocator, "/srv/tg/x");
     defer allocator.free(inside);
     try std.testing.expectEqualStrings("/srv/tg/x", inside);
+
+    // Both dirs null must be rejected.
+    const unconfined = LocalServerConfig{};
+    try std.testing.expectError(error.InvalidFilePath, unconfined.resolveLocalFilePath(allocator, "/etc/passwd"));
+
+    // Root or root-normalizing base directories must be rejected.
+    const bad_roots = [_][]const u8{ "", "/", "///", "/.", "/./.", "/tmp/.." };
+    for (bad_roots) |root_dir| {
+        const srv_root = LocalServerConfig{ .server_files_dir = root_dir, .host_files_dir = "/srv/tg" };
+        try std.testing.expectError(error.InvalidFilePath, srv_root.resolveLocalFilePath(allocator, "/etc/passwd"));
+        const host_root = LocalServerConfig{ .server_files_dir = "/var/lib/tg", .host_files_dir = root_dir };
+        try std.testing.expectError(error.InvalidFilePath, host_root.resolveLocalFilePath(allocator, "/var/lib/tg/a"));
+        const only_root = LocalServerConfig{ .host_files_dir = root_dir };
+        try std.testing.expectError(error.InvalidFilePath, only_root.resolveLocalFilePath(allocator, "/etc/passwd"));
+    }
+}
+
+test "HttpTransport disables HTTP redirects" {
+    var ht = HttpTransport.init(std.testing.allocator, std.testing.io);
+    defer ht.deinit();
+    var scratch: [64]u8 = undefined;
+    var bounded = BoundedWriter.init(std.testing.allocator, 1024, &scratch);
+    defer bounded.deinit();
+    const opts = ht.buildFetchOptions(.{ .url = "https://api.telegram.org/botX/getMe" }, &bounded.writer);
+    try std.testing.expectEqual(@as(?std.http.Client.Request.RedirectBehavior, .not_allowed), opts.redirect_behavior);
+}
+
+test "BoundedWriter handles empty splat pattern and distinguishes OOM from ResponseTooLarge" {
+    // 1. Empty pattern with huge splat must not loop.
+    var scratch1: [16]u8 = undefined;
+    var bw1 = BoundedWriter.init(std.testing.allocator, 64, &scratch1);
+    defer bw1.deinit();
+    const empty_slices = [_][]const u8{ "abc", "" };
+    const written = try BoundedWriter.drain(&bw1.writer, &empty_slices, std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 3), written);
+    const owned = try bw1.toOwnedSlice();
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings("abc", owned);
+
+    // 2. OOM sets `oom = true` (not `exceeded`) and returns error.OutOfMemory.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var scratch2: [4]u8 = undefined;
+    var bw2 = BoundedWriter.init(failing.allocator(), 1024, &scratch2);
+    defer bw2.deinit();
+    const data2 = [_][]const u8{"hello world"};
+    try std.testing.expectError(error.WriteFailed, BoundedWriter.drain(&bw2.writer, &data2, 1));
+    try std.testing.expect(bw2.oom);
+    try std.testing.expect(!bw2.exceeded);
+    try std.testing.expectError(error.OutOfMemory, bw2.toOwnedSlice());
+
+    // 3. Exceeding max_bytes sets `exceeded = true` and returns error.ResponseTooLarge.
+    var scratch3: [4]u8 = undefined;
+    var bw3 = BoundedWriter.init(std.testing.allocator, 4, &scratch3);
+    defer bw3.deinit();
+    const data3 = [_][]const u8{"12345"};
+    try std.testing.expectError(error.WriteFailed, BoundedWriter.drain(&bw3.writer, &data3, 1));
+    try std.testing.expect(bw3.exceeded);
+    try std.testing.expect(!bw3.oom);
+    try std.testing.expectError(error.ResponseTooLarge, bw3.toOwnedSlice());
 }
 
 test "HttpTransport retries only bodiless requests" {
